@@ -19,6 +19,12 @@ function hasStaffRole(member) {
   );
 }
 
+function hasAnyRole(member, roleNames = []) {
+  return !!member && roleNames.some(roleName =>
+    member.roles.cache.some(role => role.name === roleName)
+  );
+}
+
 function getStaffRoles(guild) {
   return config.staffRoles.map(name => getRoleByName(guild, name)).filter(Boolean);
 }
@@ -55,6 +61,7 @@ module.exports = {
   getCategoryByName,
   getRoleByName,
   hasStaffRole,
+  hasAnyRole,
   getStaffRoles,
   createTicketsCategoryIfMissing,
   panicLockdown

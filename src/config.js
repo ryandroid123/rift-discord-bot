@@ -4,11 +4,14 @@ module.exports = {
   staffRoles: ["Founder", "Admin", "Moderator"],
 
   channels: {
-    support: "support",
-    applications: "staff-applications",
+    support: "🎫┃support",
+    applications: "🧑‍💼┃staff-application",
     logs: "bot-logs",
     transcripts: "ticket-transcripts",
-    chat: "💬┃chat"
+    chat: "💬┃chat",
+    landing: "🛬┃landing",
+    takeoff: "🛫┃takeoff",
+    rules: "🏫┃rules"
   },
 
   categories: {
@@ -16,13 +19,21 @@ module.exports = {
   },
 
   automod: {
-    blockedWords: ["discord.gg/", "discord.com/invite/", "gg/", "nigg", "faggot", "kys"],
+    blockedWords: [
+      "discord.gg/",
+      "discord.com/invite/",
+      "gg/",
+      "nigg",
+      "faggot",
+      "kys"
+    ],
     maxMentions: 5,
     capsThreshold: 0.72,
     capsMinLetters: 12,
     repeatWindowMs: 8000,
     repeatLimit: 4,
-    suspiciousLinkPatterns: ["grabify", "iplogger", "bit.ly", "tinyurl", "t.ly", "goo.gl"]
+    suspiciousLinkPatterns: ["grabify", "iplogger", "bit.ly", "tinyurl", "t.ly", "goo.gl"],
+    capsBypassRoles: ["Founder"]
   },
 
   antinuke: {
@@ -32,18 +43,48 @@ module.exports = {
     lockdownRoleNames: ["Founder", "Admin", "Moderator"]
   },
 
+  rules: [
+    "Be respectful to everyone.",
+    "No racism, harassment, hate speech, or threats.",
+    "No NSFW content.",
+    "No scam links, phishing, or malicious files.",
+    "No advertising other servers without permission.",
+    "Do not spam messages, emojis, mentions, or reactions.",
+    "Use channels for their proper purpose.",
+    "Do not impersonate staff or other members.",
+    "Do not evade punishments.",
+    "Staff decisions are final."
+  ],
+
   riddle: {
     hour: 9,
     minute: 0,
     riddles: [
-      { q: "What has keys but can't open locks?", a: "A piano." },
-      { q: "What gets wetter the more it dries?", a: "A towel." },
-      { q: "What has hands but cannot clap?", a: "A clock." },
-      { q: "The more you take, the more you leave behind. What am I?", a: "Footsteps." },
-      { q: "What can travel around the world while staying in one corner?", a: "A stamp." },
-      { q: "What has one eye but cannot see?", a: "A needle." },
-      { q: "What is full of holes but still holds water?", a: "A sponge." },
-      { q: "What comes once in a minute, twice in a moment, but never in a thousand years?", a: "The letter M." }
+      "What has keys but can't open locks?",
+      "What gets wetter the more it dries?",
+      "What has hands but cannot clap?",
+      "The more you take, the more you leave behind. What am I?",
+      "What can travel around the world while staying in one corner?",
+      "What has one eye but cannot see?",
+      "What is full of holes but still holds water?",
+      "What comes once in a minute, twice in a moment, but never in a thousand years?",
+      "What has a neck but no head?",
+      "What has many teeth but cannot bite?",
+      "What goes up but never comes down?",
+      "What has one head, one foot, and four legs?",
+      "What has words but never speaks?",
+      "What kind of band never plays music?",
+      "What has cities, but no houses; forests, but no trees; and water, but no fish?",
+      "What can you catch, but not throw?",
+      "What begins with T, ends with T, and has T in it?",
+      "What belongs to you, but other people use it more than you do?",
+      "What has an eye, but cannot see?",
+      "What gets bigger the more you take away from it?",
+      "What has 13 hearts, but no other organs?",
+      "What has legs, but doesn’t walk?",
+      "What can fill a room but takes up no space?",
+      "What runs, but never walks?",
+      "What breaks yet never falls, and what falls yet never breaks?"
     ]
   }
 };

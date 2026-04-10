@@ -30,6 +30,7 @@ const {
   getCategoryByName,
   getRoleByName,
   hasStaffRole,
+  hasAnyRole,
   getStaffRoles,
   createTicketsCategoryIfMissing,
   panicLockdown
@@ -55,6 +56,7 @@ const statePath = path.join(dataDir, "state.json");
 const spamCache = new Map();
 const giveawayTimers = new Map();
 const inviteCache = new Map();
+const memberInviteStats = new Map();
 
 function logChannel(guild) {
   return getChannelByName(guild, config.channels.logs);
@@ -86,6 +88,10 @@ function loadWarnings() {
 
 function saveWarnings(data) {
   writeJson(warningsPath, data);
+}
+
+function canUseModCommand(member) {
+  return hasAnyRole(member, ["Founder", "Admin", "Moderator"]);
 }
 
 async function sendLog(guild, title, description, type = "info", fields = []) {
@@ -197,6 +203,39 @@ async function createTicket(guild, user, type, answers = null) {
   ]);
 
   return { channel, exists: false };
+}
+
+async function ensureRulesMessage(guild) {
+  const rulesChannel = getChannelByName(guild, config.channels.rules);
+  if (!rulesChannel) return;
+
+  const recent = await rulesChannel.messages.fetch({ limit: 20 }).catch(() => null);
+  const alreadyPosted = recent?.find(
+    m => m.author.id === client.user.id && m.embeds?.[0]?.title === "Rift Studios Rules"
+  );
+
+  if (alreadyPosted) return;
+
+  await rulesChannel.send({
+    embeds: [
+      makeEmbed(
+        "Rift Studios Rules",
+        config.rules.map((rule, i) => `**${i + 1}.** ${rule}`).join("\n"),
+        "warn"
+      )
+    ]
+  }).catch(() => {});
+}
+
+function loadInviteCountsFromState() {
+  const s = state();
+  return new Map(s.inviteCounts || []);
+}
+
+function saveInviteCountsToState(map) {
+  const s = state();
+  s.inviteCounts = [...map.entries()];
+  saveState(s);
 }
 
 async function endGiveaway(messageId) {
@@ -324,7 +363,7 @@ async function maybePostDailyRiddle() {
       embeds: [
         makeEmbed(
           "🧩 Riddle of the Day",
-          `**Riddle:** ${r.q}\n\n||**Answer:** ${r.a}||`,
+          `**Riddle:** ${r}\n\nReply in chat with your guess.`,
           "info"
         )
       ]
@@ -382,8 +421,15 @@ client.once(Events.ClientReady, async () => {
     console.error("REGISTER ERROR:", err);
   }
 
+  memberInviteStats.clear();
+  const savedInvites = loadInviteCountsFromState();
+  for (const [k, v] of savedInvites.entries()) {
+    memberInviteStats.set(k, v);
+  }
+
   for (const guild of client.guilds.cache.values()) {
     await cacheInvitesForGuild(guild);
+    await ensureRulesMessage(guild);
   }
 
   for (const giveaway of loadGiveaways().filter(g => !g.ended)) {
@@ -396,6 +442,7 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InviteCreate, async invite => {
   await cacheInvitesForGuild(invite.guild).catch(() => {});
 });
+
 client.on(Events.InviteDelete, async invite => {
   await cacheInvitesForGuild(invite.guild).catch(() => {});
 });
@@ -406,7 +453,44 @@ client.on(Events.GuildMemberAdd, async member => {
     await member.roles.add(role).catch(() => {});
   }
 
-    await member.send({
+  let inviterText = "Unknown";
+  let inviterId = null;
+
+  const oldMap = inviteCache.get(member.guild.id) || new Map();
+  const newInvites = await member.guild.invites.fetch().catch(() => null);
+
+  if (newInvites) {
+    const used = newInvites.find(inv => (inv.uses || 0) > (oldMap.get(inv.code) || 0));
+    if (used?.inviter) {
+      inviterText = `${used.inviter.tag} (${used.code})`;
+      inviterId = used.inviter.id;
+
+      const key = `${member.guild.id}:${inviterId}`;
+      memberInviteStats.set(key, (memberInviteStats.get(key) || 0) + 1);
+      saveInviteCountsToState(memberInviteStats);
+    }
+
+    inviteCache.set(member.guild.id, new Map(newInvites.map(inv => [inv.code, inv.uses || 0])));
+  }
+
+  await sendLog(member.guild, "Member Joined", `${member.user.tag} joined and received the ${config.autoRole} role.`, "success", [
+    { name: "Invited By", value: inviterText }
+  ]);
+
+  const landing = getChannelByName(member.guild, config.channels.landing);
+  if (landing) {
+    await landing.send({
+      embeds: [
+        makeEmbed(
+          "Welcome to Rift Studios",
+          `Welcome ${member} to **${member.guild.name}**.\n\nThank you for joining **.gg/riftstudios**!\nStay tuned for the game's release 👀`,
+          "success"
+        )
+      ]
+    }).catch(() => {});
+  }
+
+  await member.send({
     embeds: [
       makeEmbed(
         "Welcome to Rift Studios",
@@ -415,31 +499,23 @@ client.on(Events.GuildMemberAdd, async member => {
       )
     ]
   }).catch(() => {});
-
-  let inviterText = "Unknown";
-  const oldMap = inviteCache.get(member.guild.id) || new Map();
-  const newInvites = await member.guild.invites.fetch().catch(() => null);
-
-  if (newInvites) {
-    const used = newInvites.find(inv => (inv.uses || 0) > (oldMap.get(inv.code) || 0));
-    if (used?.inviter) inviterText = `${used.inviter.tag} (${used.code})`;
-    inviteCache.set(member.guild.id, new Map(newInvites.map(inv => [inv.code, inv.uses || 0])));
-  }
-
-  await sendLog(member.guild, "Member Joined", `${member.user.tag} joined and received the ${config.autoRole} role.`, "success", [
-    { name: "Invited By", value: inviterText }
-  ]);
-
-  const chat = getChannelByName(member.guild, config.channels.chat);
-  if (chat) {
-    await chat.send({
-      embeds: [makeEmbed("Welcome!", `Welcome ${member} to **${member.guild.name}**. Enjoy your stay.`, "success")]
-    }).catch(() => {});
-  }
 });
 
 client.on(Events.GuildMemberRemove, async member => {
   await sendLog(member.guild, "Member Left", `${member.user.tag} left the server.`, "warn");
+
+  const takeoff = getChannelByName(member.guild, config.channels.takeoff);
+  if (takeoff) {
+    await takeoff.send({
+      embeds: [
+        makeEmbed(
+          "Member Left",
+          `**${member.user.tag}** has left **${member.guild.name}**.`,
+          "warn"
+        )
+      ]
+    }).catch(() => {});
+  }
 });
 
 client.on(Events.MessageCreate, async message => {
@@ -471,7 +547,9 @@ client.on(Events.MessageCreate, async message => {
 
   const letters = message.content.replace(/[^a-z]/gi, "");
   const caps = letters.replace(/[^A-Z]/g, "").length;
-  if (letters.length >= config.automod.capsMinLetters && caps / letters.length >= config.automod.capsThreshold) {
+  const bypassCaps = hasAnyRole(message.member, config.automod.capsBypassRoles || []);
+
+  if (!bypassCaps && letters.length >= config.automod.capsMinLetters && caps / letters.length >= config.automod.capsThreshold) {
     await message.delete().catch(() => {});
     await sendLog(message.guild, "AutoMod", `Caps spam removed from ${message.author.tag}.`, "warn");
     return;
@@ -551,6 +629,7 @@ client.on(Events.InteractionCreate, async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
       const cmd = interaction.commandName;
+      const member = interaction.member;
 
       if (cmd === "ping") {
         await interaction.reply({ embeds: [makeEmbed("Pong!", "The bot is online.", "success")] });
@@ -558,10 +637,11 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "allcommands") {
-        if (!hasStaffRole(interaction.member)) {
+        if (!hasStaffRole(member)) {
           await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
           return;
         }
+
         await interaction.reply({
           embeds: [makeEmbed("All Commands", commands.map(c => `/${c.name}`).join("\n"), "info")],
           ephemeral: true
@@ -610,6 +690,11 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "timeout") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+
         const user = interaction.options.getUser("user");
         const duration = interaction.options.getString("duration");
         const reason = interaction.options.getString("reason") || "No reason provided";
@@ -629,6 +714,11 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "untimeout") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+
         const user = interaction.options.getUser("user");
         const reason = interaction.options.getString("reason") || "No reason provided";
         const target = await interaction.guild.members.fetch(user.id).catch(() => null);
@@ -703,6 +793,11 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "warn") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+
         const user = interaction.options.getUser("user");
         const reason = interaction.options.getString("reason");
         const count = addWarning(interaction.guild.id, user.id, interaction.user.tag, reason);
@@ -718,12 +813,34 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "warnings") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+
         const user = interaction.options.getUser("user");
         const warnings = getWarnings(interaction.guild.id, user.id);
         const description = warnings.length
           ? warnings.map((w, i) => `**${i + 1}.** ${w.reason} — ${w.moderatorTag}`).join("\n").slice(0, 4000)
           : "No warnings.";
         await interaction.reply({ embeds: [makeEmbed(`Warnings for ${user.tag}`, description, "info")], ephemeral: true });
+        return;
+      }
+
+      if (cmd === "invites") {
+        const user = interaction.options.getUser("user") || interaction.user;
+        const key = `${interaction.guild.id}:${user.id}`;
+        const count = memberInviteStats.get(key) || 0;
+
+        await interaction.reply({
+          embeds: [
+            makeEmbed(
+              "Invite Count",
+              `**${user.tag}** has **${count}** tracked invite${count === 1 ? "" : "s"}.`,
+              "info"
+            )
+          ]
+        });
         return;
       }
 
@@ -740,13 +857,11 @@ client.on(Events.InteractionCreate, async interaction => {
         const endsAt = Date.now() + durationMs;
 
         const sent = await channel.send({
-          embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${prize}\n**Ends:** <t:${Math.floor(endsAt / 1000)}:R>`, "info")],
-          components: [new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`join_giveaway_pending`).setLabel("Join Giveaway").setStyle(ButtonStyle.Success)
-          )]
+          embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${prize}\n**Ends:** <t:${Math.floor(endsAt / 1000)}:R>`, "info")]
         });
 
         await sent.edit({
+          embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${prize}\n**Ends:** <t:${Math.floor(endsAt / 1000)}:R>`, "info")],
           components: [new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`join_giveaway_${sent.id}`).setLabel("Join Giveaway").setStyle(ButtonStyle.Success)
           )]
@@ -791,11 +906,11 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (cmd === "userinfo") {
         const user = interaction.options.getUser("user") || interaction.user;
-        const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+        const memberObj = await interaction.guild.members.fetch(user.id).catch(() => null);
         await interaction.reply({
           embeds: [makeEmbed(`User Info: ${user.tag}`, `ID: ${user.id}`, "info", [
             { name: "Created", value: `<t:${Math.floor(user.createdTimestamp / 1000)}:F>` },
-            { name: "Joined", value: member ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:F>` : "Unknown" }
+            { name: "Joined", value: memberObj ? `<t:${Math.floor(memberObj.joinedTimestamp / 1000)}:F>` : "Unknown" }
           ])]
         });
         return;
@@ -820,6 +935,72 @@ client.on(Events.InteractionCreate, async interaction => {
         await msg.react("✅").catch(() => {});
         await msg.react("❌").catch(() => {});
         await interaction.reply({ embeds: [makeEmbed("Poll Created", "Your poll has been posted.", "success")], ephemeral: true });
+        return;
+      }
+
+      if (cmd === "sayembed") {
+        const title = interaction.options.getString("title");
+        const description = interaction.options.getString("description");
+
+        await interaction.channel.send({
+          embeds: [makeEmbed(title, description, "info")]
+        });
+
+        await interaction.reply({
+          embeds: [makeEmbed("Embed Sent", "Your embedded message has been posted.", "success")],
+          ephemeral: true
+        });
+        return;
+      }
+
+      if (cmd === "avatar") {
+        const user = interaction.options.getUser("user") || interaction.user;
+
+        await interaction.reply({
+          embeds: [makeEmbed(`${user.tag}'s Avatar`, user.displayAvatarURL({ size: 1024 }), "info")]
+        });
+        return;
+      }
+
+      if (cmd === "roleinfo") {
+        const role = interaction.options.getRole("role");
+
+        await interaction.reply({
+          embeds: [makeEmbed(`Role Info: ${role.name}`, `ID: ${role.id}`, "info", [
+            { name: "Members", value: String(role.members.size), inline: true },
+            { name: "Color", value: role.hexColor, inline: true },
+            { name: "Position", value: String(role.position), inline: true }
+          ])]
+        });
+        return;
+      }
+
+      if (cmd === "suggest") {
+        const idea = interaction.options.getString("idea");
+
+        const msg = await interaction.channel.send({
+          embeds: [makeEmbed("💡 New Suggestion", idea, "info", [
+            { name: "Suggested By", value: interaction.user.tag }
+          ])]
+        });
+
+        await msg.react("✅").catch(() => {});
+        await msg.react("❌").catch(() => {});
+        await msg.react("🤔").catch(() => {});
+
+        await interaction.reply({
+          embeds: [makeEmbed("Suggestion Posted", "Your suggestion has been posted.", "success")],
+          ephemeral: true
+        });
+        return;
+      }
+
+      if (cmd === "riddle") {
+        const r = config.riddle.riddles[Math.floor(Math.random() * config.riddle.riddles.length)];
+
+        await interaction.reply({
+          embeds: [makeEmbed("🧩 Random Riddle", `**Riddle:** ${r}\n\nReply with your guess.`, "info")]
+        });
         return;
       }
     }
@@ -888,16 +1069,20 @@ client.on(Events.InteractionCreate, async interaction => {
         const messageId = interaction.customId.replace("join_giveaway_", "");
         const giveaways = loadGiveaways();
         const giveaway = giveaways.find(g => g.messageId === messageId);
+
         if (!giveaway || giveaway.ended) {
           await interaction.reply({ embeds: [makeEmbed("Giveaway Ended", "This giveaway is no longer active.", "error")], ephemeral: true });
           return;
         }
+
         if (giveaway.entries.includes(interaction.user.id)) {
           await interaction.reply({ embeds: [makeEmbed("Already Entered", "You already joined this giveaway.", "warn")], ephemeral: true });
           return;
         }
+
         giveaway.entries.push(interaction.user.id);
         saveGiveaways(giveaways);
+
         await interaction.reply({ embeds: [makeEmbed("Entry Confirmed", "You joined the giveaway.", "success")], ephemeral: true });
         return;
       }

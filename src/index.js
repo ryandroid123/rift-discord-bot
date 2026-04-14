@@ -670,6 +670,16 @@ client.on(Events.InteractionCreate, async interaction => {
       const cmd = interaction.commandName;
       const member = interaction.member;
 
+      if (cmd === "registercmds" && interaction.user.id === "965922934801711164") {
+        const rest2 = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+        await rest2.put(
+          Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+          { body: commands }
+        );
+        await interaction.reply({ content: "Commands registered!", ephemeral: true });
+        return;
+      }
+
       if (cmd === "ping") {
         await interaction.reply({ embeds: [makeEmbed("Pong!", "The bot is online.", "success")] });
         return;

@@ -425,6 +425,7 @@ function getWarnings(guildId, userId) {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
+});
 
 client.on(Events.GuildMemberAdd, async member => {
   const role = getRoleByName(member.guild, config.autoRole);

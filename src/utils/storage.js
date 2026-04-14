@@ -1,17 +1,18 @@
 const fs = require("fs");
 const path = require("path");
 
-function ensureFile(filePath, defaultValue) {
+function ensureDir(filePath) {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, JSON.stringify(defaultValue, null, 2), "utf8");
-  }
 }
 
 function readJson(filePath, defaultValue) {
-  ensureFile(filePath, defaultValue);
   try {
+    ensureDir(filePath);
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify(defaultValue, null, 2), "utf8");
+      return defaultValue;
+    }
     const raw = fs.readFileSync(filePath, "utf8");
     return raw.trim() ? JSON.parse(raw) : defaultValue;
   } catch {
@@ -20,7 +21,7 @@ function readJson(filePath, defaultValue) {
 }
 
 function writeJson(filePath, value) {
-  ensureFile(filePath, value);
+  ensureDir(filePath);
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
 }
 

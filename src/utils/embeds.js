@@ -1,5 +1,3 @@
-const { EmbedBuilder } = require("discord.js");
-
 function color(type = "info") {
   return {
     success: 0x57f287,
@@ -11,14 +9,13 @@ function color(type = "info") {
 }
 
 function makeEmbed(title, description, type = "info", fields = []) {
-  const e = new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(description)
-    .setColor(color(type))
-    .setTimestamp();
-
-  if (fields.length) e.addFields(fields);
-  return e;
+  return {
+    title,
+    description,
+    color: color(type),
+    fields,
+    timestamp: new Date().toISOString()
+  };
 }
 
 module.exports = { makeEmbed };

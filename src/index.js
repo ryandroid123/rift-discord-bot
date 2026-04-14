@@ -1,5 +1,10 @@
 require("dotenv").config();
 
+console.log("STARTING BOT...");
+console.log("TOKEN EXISTS:", !!process.env.DISCORD_TOKEN);
+console.log("CLIENT_ID:", process.env.CLIENT_ID);
+console.log("GUILD_ID:", process.env.GUILD_ID);
+
 const fs = require("fs");
 const path = require("path");
 const ms = require("ms");
@@ -35,6 +40,7 @@ const {
   createTicketsCategoryIfMissing,
   panicLockdown
 } = require("./utils/setup");
+const { checkStreams, loadStreams, saveStreams, checkTwitch, checkYouTube, checkKick, checkTikTok } = require("./utils/socials");
 
 const client = new Client({
   intents: [
@@ -52,6 +58,8 @@ const giveawaysPath = path.join(dataDir, "giveaways.json");
 const antinukePath = path.join(dataDir, "antinuke.json");
 const warningsPath = path.join(dataDir, "warnings.json");
 const statePath = path.join(dataDir, "state.json");
+const afkPath = path.join(dataDir, "afk.json");
+const snipePath = path.join(dataDir, "snipe.json");
 
 const spamCache = new Map();
 const giveawayTimers = new Map();
@@ -67,7 +75,7 @@ function transcriptChannel(guild) {
 }
 
 function state() {
-  return readJson(statePath, { lastRiddleDate: null });
+  return readJson(statePath, { lastRiddleDate: null, inviteCounts: [] });
 }
 
 function saveState(value) {
@@ -88,6 +96,22 @@ function loadWarnings() {
 
 function saveWarnings(data) {
   writeJson(warningsPath, data);
+}
+
+function loadAFK() {
+  return readJson(afkPath, {});
+}
+
+function saveAFK(data) {
+  writeJson(afkPath, data);
+}
+
+function loadSnipes() {
+  return readJson(snipePath, {});
+}
+
+function saveSnipes(data) {
+  writeJson(snipePath, data);
 }
 
 function canUseModCommand(member) {
@@ -401,42 +425,13 @@ function getWarnings(guildId, userId) {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  console.log("Registering to guild:", process.env.GUILD_ID);
 
-  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-
-  try {
-    await rest.put(
-      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-      { body: [] }
-    );
-    console.log("Old commands cleared.");
-
-    await rest.put(
-      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-      { body: commands }
-    );
-    console.log("Commands registered.");
+    console.log("Commands registered:", Array.isArray(result) ? result.length : result);
   } catch (err) {
-    console.error("REGISTER ERROR:", err);
+    console.error("REGISTER ERROR:", err.message);
+    console.error("STATUS:", err.status);
+    console.error("RAW ERROR:", JSON.stringify(err.rawError));
   }
-
-  memberInviteStats.clear();
-  const savedInvites = loadInviteCountsFromState();
-  for (const [k, v] of savedInvites.entries()) {
-    memberInviteStats.set(k, v);
-  }
-
-  for (const guild of client.guilds.cache.values()) {
-    await cacheInvitesForGuild(guild);
-    await ensureRulesMessage(guild);
-  }
-
-  for (const giveaway of loadGiveaways().filter(g => !g.ended)) {
-    scheduleGiveaway(giveaway);
-  }
-
-  startRiddleLoop();
 });
 
 client.on(Events.InviteCreate, async invite => {
@@ -518,8 +513,32 @@ client.on(Events.GuildMemberRemove, async member => {
   }
 });
 
+client.on(Events.MessageDelete, async message => {
+  if (!message.guild || !message.author || message.author.bot) return;
+  const snipes = loadSnipes();
+  snipes[message.channel.id] = {
+    content: message.content || "[embed/attachment]",
+    author: message.author.tag,
+    time: Date.now()
+  };
+  saveSnipes(snipes);
+});
+
 client.on(Events.MessageCreate, async message => {
   if (!message.guild || message.author.bot) return;
+
+  const afk = loadAFK();
+  if (afk[message.author.id]) {
+    delete afk[message.author.id];
+    saveAFK(afk);
+    await message.reply("Welcome back, AFK removed.").catch(() => {});
+  }
+
+  message.mentions.users.forEach(async user => {
+    if (afk[user.id]) {
+      await message.reply(`${user.tag} is AFK: ${afk[user.id]}`).catch(() => {});
+    }
+  });
 
   const lower = message.content.toLowerCase();
 
@@ -575,6 +594,7 @@ async function fetchExecutor(guild, type) {
 
 client.on(Events.ChannelDelete, async channel => {
   if (channel.guild) {
+    await sendLog(channel.guild, "Channel Deleted", `${channel.name} was deleted.`, "error");
     const executorId = await fetchExecutor(channel.guild, AuditLogEvent.ChannelDelete);
     if (executorId) await antiNukeCheck(channel.guild, executorId, "channel delete");
   }
@@ -582,13 +602,21 @@ client.on(Events.ChannelDelete, async channel => {
 
 client.on(Events.ChannelCreate, async channel => {
   if (channel.guild) {
+    await sendLog(channel.guild, "Channel Created", `${channel.name} was created.`, "success");
     const executorId = await fetchExecutor(channel.guild, AuditLogEvent.ChannelCreate);
     if (executorId) await antiNukeCheck(channel.guild, executorId, "channel create");
   }
 });
 
+client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
+  if (newChannel.guild && oldChannel.name !== newChannel.name) {
+    await sendLog(newChannel.guild, "Channel Updated", `${oldChannel.name} renamed to ${newChannel.name}.`, "info");
+  }
+});
+
 client.on(Events.RoleDelete, async role => {
   if (role.guild) {
+    await sendLog(role.guild, "Role Deleted", `${role.name} was deleted.`, "error");
     const executorId = await fetchExecutor(role.guild, AuditLogEvent.RoleDelete);
     if (executorId) await antiNukeCheck(role.guild, executorId, "role delete");
   }
@@ -596,18 +624,17 @@ client.on(Events.RoleDelete, async role => {
 
 client.on(Events.RoleCreate, async role => {
   if (role.guild) {
+    await sendLog(role.guild, "Role Created", `${role.name} was created.`, "success");
     const executorId = await fetchExecutor(role.guild, AuditLogEvent.RoleCreate);
     if (executorId) await antiNukeCheck(role.guild, executorId, "role create");
   }
 });
 
-client.on(Events.WebhooksUpdate, async channel => {
-  if (!channel.guild) return;
-  const executorId = await fetchExecutor(channel.guild, AuditLogEvent.WebhookCreate);
-  if (executorId) await antiNukeCheck(channel.guild, executorId, "webhook update");
-});
-
 client.on(Events.RoleUpdate, async (oldRole, newRole) => {
+  if (oldRole.name !== newRole.name) {
+    await sendLog(newRole.guild, "Role Updated", `${oldRole.name} renamed to ${newRole.name}.`, "info");
+  }
+
   const before = new PermissionsBitField(oldRole.permissions.bitfield);
   const after = new PermissionsBitField(newRole.permissions.bitfield);
   const dangerous = [
@@ -623,6 +650,13 @@ client.on(Events.RoleUpdate, async (oldRole, newRole) => {
 
   const executorId = await fetchExecutor(newRole.guild, AuditLogEvent.RoleUpdate);
   if (executorId) await antiNukeCheck(newRole.guild, executorId, "dangerous role permission escalation");
+});
+
+client.on(Events.WebhooksUpdate, async channel => {
+  if (!channel.guild) return;
+  await sendLog(channel.guild, "Webhook Update", `Webhook update detected in ${channel.name}.`, "warn");
+  const executorId = await fetchExecutor(channel.guild, AuditLogEvent.WebhookCreate);
+  if (executorId) await antiNukeCheck(channel.guild, executorId, "webhook update");
 });
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -651,24 +685,38 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (cmd === "setup-support-panel") {
         await interaction.deferReply({ ephemeral: true });
+
         await interaction.channel.send({
           embeds: [makeEmbed("Support Tickets", "Click below to open a private support ticket.", "info")],
-          components: [new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("open_support_ticket").setLabel("Open Support Ticket").setStyle(ButtonStyle.Primary)
-          )]
+          components: [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setCustomId("open_support_ticket")
+                .setLabel("Open Support Ticket")
+                .setStyle(ButtonStyle.Primary)
+            )
+          ]
         });
+
         await interaction.editReply({ embeds: [makeEmbed("Done", "Support panel posted.", "success")] });
         return;
       }
 
       if (cmd === "setup-application-panel") {
         await interaction.deferReply({ ephemeral: true });
+
         await interaction.channel.send({
           embeds: [makeEmbed("Staff Applications", "Click below to open a private application ticket.", "info")],
-          components: [new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("open_application_ticket").setLabel("Apply For Staff").setStyle(ButtonStyle.Secondary)
-          )]
+          components: [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setCustomId("open_application_ticket")
+                .setLabel("Apply For Staff")
+                .setStyle(ButtonStyle.Secondary)
+            )
+          ]
         });
+
         await interaction.editReply({ embeds: [makeEmbed("Done", "Application panel posted.", "success")] });
         return;
       }
@@ -678,13 +726,17 @@ client.on(Events.InteractionCreate, async interaction => {
           await interaction.reply({ embeds: [makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
           return;
         }
+
         const messages = await interaction.channel.messages.fetch({ limit: 200 }).catch(() => null);
         const lines = [...(messages?.values() || [])]
           .reverse()
           .map(m => `[${new Date(m.createdTimestamp).toLocaleString()}] ${m.author.tag}: ${m.content || "[embed/attachment]"}`);
+
         await sendTranscript(interaction.guild, interaction.channel, lines);
+
         await interaction.reply({ embeds: [makeEmbed("Closing Ticket", "This ticket will be deleted in 5 seconds.", "warn")] });
         await sendLog(interaction.guild, "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn");
+
         setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
         return;
       }
@@ -700,12 +752,15 @@ client.on(Events.InteractionCreate, async interaction => {
         const reason = interaction.options.getString("reason") || "No reason provided";
         const target = await interaction.guild.members.fetch(user.id).catch(() => null);
         const durationMs = ms(duration);
+
         if (!target || !durationMs) {
           await interaction.reply({ embeds: [makeEmbed("Error", "Invalid user or duration.", "error")], ephemeral: true });
           return;
         }
+
         await target.timeout(durationMs, reason);
         await interaction.reply({ embeds: [makeEmbed("Timed Out", `${user.tag} has been timed out.`, "warn")] });
+
         await sendLog(interaction.guild, "Member Timed Out", `${interaction.user.tag} timed out ${user.tag}.`, "warn", [
           { name: "Duration", value: duration, inline: true },
           { name: "Reason", value: reason, inline: true }
@@ -722,22 +777,31 @@ client.on(Events.InteractionCreate, async interaction => {
         const user = interaction.options.getUser("user");
         const reason = interaction.options.getString("reason") || "No reason provided";
         const target = await interaction.guild.members.fetch(user.id).catch(() => null);
+
         if (!target) {
           await interaction.reply({ embeds: [makeEmbed("Error", "User not found.", "error")], ephemeral: true });
           return;
         }
+
         await target.timeout(null, reason);
         await interaction.reply({ embeds: [makeEmbed("Timeout Removed", `${user.tag}'s timeout was removed.`, "success")] });
-        await sendLog(interaction.guild, "Timeout Removed", `${interaction.user.tag} removed ${user.tag}'s timeout.`, "success", [{ name: "Reason", value: reason }]);
+
+        await sendLog(interaction.guild, "Timeout Removed", `${interaction.user.tag} removed ${user.tag}'s timeout.`, "success", [
+          { name: "Reason", value: reason }
+        ]);
         return;
       }
 
       if (cmd === "ban") {
         const user = interaction.options.getUser("user");
         const reason = interaction.options.getString("reason") || "No reason provided";
+
         await interaction.guild.members.ban(user.id, { reason });
+
         await interaction.reply({ embeds: [makeEmbed("Member Banned", `${user.tag} has been banned.`, "error")] });
-        await sendLog(interaction.guild, "Member Banned", `${interaction.user.tag} banned ${user.tag}.`, "error", [{ name: "Reason", value: reason }]);
+        await sendLog(interaction.guild, "Member Banned", `${interaction.user.tag} banned ${user.tag}.`, "error", [
+          { name: "Reason", value: reason }
+        ]);
         return;
       }
 
@@ -745,30 +809,41 @@ client.on(Events.InteractionCreate, async interaction => {
         const user = interaction.options.getUser("user");
         const reason = interaction.options.getString("reason") || "No reason provided";
         const target = await interaction.guild.members.fetch(user.id).catch(() => null);
+
         if (!target) {
           await interaction.reply({ embeds: [makeEmbed("Error", "User not found.", "error")], ephemeral: true });
           return;
         }
+
         await target.kick(reason);
+
         await interaction.reply({ embeds: [makeEmbed("Member Kicked", `${user.tag} has been kicked.`, "warn")] });
-        await sendLog(interaction.guild, "Member Kicked", `${interaction.user.tag} kicked ${user.tag}.`, "warn", [{ name: "Reason", value: reason }]);
+        await sendLog(interaction.guild, "Member Kicked", `${interaction.user.tag} kicked ${user.tag}.`, "warn", [
+          { name: "Reason", value: reason }
+        ]);
         return;
       }
 
       if (cmd === "purge") {
         const amount = interaction.options.getInteger("amount");
+
         if (amount < 1 || amount > 100) {
           await interaction.reply({ embeds: [makeEmbed("Invalid Amount", "Pick a number from 1 to 100.", "error")], ephemeral: true });
           return;
         }
+
         const deleted = await interaction.channel.bulkDelete(amount, true);
+
         await interaction.reply({ embeds: [makeEmbed("Messages Deleted", `Deleted ${deleted.size} messages.`, "success")], ephemeral: true });
-        await sendLog(interaction.guild, "Messages Purged", `${interaction.user.tag} purged messages in ${interaction.channel}.`, "warn", [{ name: "Deleted", value: String(deleted.size) }]);
+        await sendLog(interaction.guild, "Messages Purged", `${interaction.user.tag} purged messages in ${interaction.channel}.`, "warn", [
+          { name: "Deleted", value: String(deleted.size) }
+        ]);
         return;
       }
 
       if (cmd === "lock") {
         await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false });
+
         await interaction.reply({ embeds: [makeEmbed("Channel Locked", `${interaction.channel} has been locked.`, "warn")] });
         await sendLog(interaction.guild, "Channel Locked", `${interaction.user.tag} locked ${interaction.channel}.`, "warn");
         return;
@@ -776,6 +851,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (cmd === "unlock") {
         await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: true });
+
         await interaction.reply({ embeds: [makeEmbed("Channel Unlocked", `${interaction.channel} has been unlocked.`, "success")] });
         await sendLog(interaction.guild, "Channel Unlocked", `${interaction.user.tag} unlocked ${interaction.channel}.`, "success");
         return;
@@ -783,11 +859,14 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (cmd === "slowmode") {
         const seconds = interaction.options.getInteger("seconds");
+
         if (seconds < 0 || seconds > 21600) {
           await interaction.reply({ embeds: [makeEmbed("Error", "Slowmode must be from 0 to 21600 seconds.", "error")], ephemeral: true });
           return;
         }
+
         await interaction.channel.setRateLimitPerUser(seconds);
+
         await interaction.reply({ embeds: [makeEmbed("Slowmode Updated", `Slowmode set to ${seconds} seconds.`, "success")] });
         return;
       }
@@ -800,11 +879,16 @@ client.on(Events.InteractionCreate, async interaction => {
 
         const user = interaction.options.getUser("user");
         const reason = interaction.options.getString("reason");
+
         const count = addWarning(interaction.guild.id, user.id, interaction.user.tag, reason);
-        await interaction.reply({ embeds: [makeEmbed("Member Warned", `${user.tag} has been warned.`, "warn", [
-          { name: "Reason", value: reason },
-          { name: "Total Warnings", value: String(count) }
-        ])] });
+
+        await interaction.reply({
+          embeds: [makeEmbed("Member Warned", `${user.tag} has been warned.`, "warn", [
+            { name: "Reason", value: reason },
+            { name: "Total Warnings", value: String(count) }
+          ])]
+        });
+
         await sendLog(interaction.guild, "Member Warned", `${interaction.user.tag} warned ${user.tag}.`, "warn", [
           { name: "Reason", value: reason },
           { name: "Total Warnings", value: String(count) }
@@ -823,6 +907,7 @@ client.on(Events.InteractionCreate, async interaction => {
         const description = warnings.length
           ? warnings.map((w, i) => `**${i + 1}.** ${w.reason} — ${w.moderatorTag}`).join("\n").slice(0, 4000)
           : "No warnings.";
+
         await interaction.reply({ embeds: [makeEmbed(`Warnings for ${user.tag}`, description, "info")], ephemeral: true });
         return;
       }
@@ -833,13 +918,7 @@ client.on(Events.InteractionCreate, async interaction => {
         const count = memberInviteStats.get(key) || 0;
 
         await interaction.reply({
-          embeds: [
-            makeEmbed(
-              "Invite Count",
-              `**${user.tag}** has **${count}** tracked invite${count === 1 ? "" : "s"}.`,
-              "info"
-            )
-          ]
+          embeds: [makeEmbed("Invite Count", `**${user.tag}** has **${count}** tracked invite${count === 1 ? "" : "s"}.`, "info")]
         });
         return;
       }
@@ -848,6 +927,7 @@ client.on(Events.InteractionCreate, async interaction => {
         const duration = interaction.options.getString("duration");
         const prize = interaction.options.getString("prize");
         const durationMs = ms(duration);
+
         if (!durationMs) {
           await interaction.reply({ embeds: [makeEmbed("Error", "Use a valid duration like 10m, 1h, or 1d.", "error")], ephemeral: true });
           return;
@@ -857,14 +937,19 @@ client.on(Events.InteractionCreate, async interaction => {
         const endsAt = Date.now() + durationMs;
 
         const sent = await channel.send({
-          embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${prize}\n**Ends:** <t:${Math.floor(endsAt / 1000)}:R>`, "info")]
+          embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${prize}\n**Ends:** <t:${Math.floor(endsAt / 1000)}:R>\nEntries: **0**`, "info")]
         });
 
         await sent.edit({
-          embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${prize}\n**Ends:** <t:${Math.floor(endsAt / 1000)}:R>`, "info")],
-          components: [new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`join_giveaway_${sent.id}`).setLabel("Join Giveaway").setStyle(ButtonStyle.Success)
-          )]
+          embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${prize}\n**Ends:** <t:${Math.floor(endsAt / 1000)}:R>\nEntries: **0**`, "info")],
+          components: [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setCustomId(`join_giveaway_${sent.id}`)
+                .setLabel("Join Giveaway")
+                .setStyle(ButtonStyle.Success)
+            )
+          ]
         });
 
         const giveaways = loadGiveaways();
@@ -885,7 +970,9 @@ client.on(Events.InteractionCreate, async interaction => {
         scheduleGiveaway(giveaway);
 
         await interaction.reply({ embeds: [makeEmbed("Giveaway Created", `Your giveaway was posted in ${channel}.`, "success")], ephemeral: true });
-        await sendLog(interaction.guild, "Giveaway Created", `${interaction.user.tag} created a giveaway.`, "info", [{ name: "Prize", value: prize }]);
+        await sendLog(interaction.guild, "Giveaway Created", `${interaction.user.tag} created a giveaway.`, "info", [
+          { name: "Prize", value: prize }
+        ]);
         return;
       }
 
@@ -893,13 +980,16 @@ client.on(Events.InteractionCreate, async interaction => {
         const messageId = interaction.options.getString("messageid");
         const giveaways = loadGiveaways();
         const giveaway = giveaways.find(g => g.messageId === messageId);
+
         if (!giveaway || !giveaway.entries.length) {
           await interaction.reply({ embeds: [makeEmbed("Error", "That giveaway was not found or has no entries.", "error")], ephemeral: true });
           return;
         }
+
         const winnerId = giveaway.entries[Math.floor(Math.random() * giveaway.entries.length)];
         giveaway.winnerId = winnerId;
         saveGiveaways(giveaways);
+
         await interaction.reply({ embeds: [makeEmbed("Giveaway Rerolled", `New winner: <@${winnerId}>`, "success")] });
         return;
       }
@@ -907,6 +997,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (cmd === "userinfo") {
         const user = interaction.options.getUser("user") || interaction.user;
         const memberObj = await interaction.guild.members.fetch(user.id).catch(() => null);
+
         await interaction.reply({
           embeds: [makeEmbed(`User Info: ${user.tag}`, `ID: ${user.id}`, "info", [
             { name: "Created", value: `<t:${Math.floor(user.createdTimestamp / 1000)}:F>` },
@@ -929,11 +1020,11 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (cmd === "poll") {
         const question = interaction.options.getString("question");
-        const msg = await interaction.channel.send({
-          embeds: [makeEmbed("📊 Poll", question, "info")]
-        });
+        const msg = await interaction.channel.send({ embeds: [makeEmbed("📊 Poll", question, "info")] });
+
         await msg.react("✅").catch(() => {});
         await msg.react("❌").catch(() => {});
+
         await interaction.reply({ embeds: [makeEmbed("Poll Created", "Your poll has been posted.", "success")], ephemeral: true });
         return;
       }
@@ -942,14 +1033,8 @@ client.on(Events.InteractionCreate, async interaction => {
         const title = interaction.options.getString("title");
         const description = interaction.options.getString("description");
 
-        await interaction.channel.send({
-          embeds: [makeEmbed(title, description, "info")]
-        });
-
-        await interaction.reply({
-          embeds: [makeEmbed("Embed Sent", "Your embedded message has been posted.", "success")],
-          ephemeral: true
-        });
+        await interaction.channel.send({ embeds: [makeEmbed(title, description, "info")] });
+        await interaction.reply({ content: "Embed sent.", ephemeral: true });
         return;
       }
 
@@ -988,10 +1073,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await msg.react("❌").catch(() => {});
         await msg.react("🤔").catch(() => {});
 
-        await interaction.reply({
-          embeds: [makeEmbed("Suggestion Posted", "Your suggestion has been posted.", "success")],
-          ephemeral: true
-        });
+        await interaction.reply({ embeds: [makeEmbed("Suggestion Posted", "Your suggestion has been posted.", "success")], ephemeral: true });
         return;
       }
 
@@ -1003,11 +1085,87 @@ client.on(Events.InteractionCreate, async interaction => {
         });
         return;
       }
+
+      if (cmd === "addstream") {
+        const name = interaction.options.getString("name");
+        const platform = interaction.options.getString("platform");
+        const handle = interaction.options.getString("handle");
+
+        const streams = loadStreams();
+
+        if (streams.some(s => s.name.toLowerCase() === name.toLowerCase())) {
+          await interaction.reply({
+            embeds: [makeEmbed("Already Added", `${name} is already being tracked.`, "warn")],
+            ephemeral: true
+          });
+          return;
+        }
+
+        let liveNow = false;
+        try {
+          if (platform === "twitch") liveNow = await checkTwitch(handle);
+          if (platform === "youtube") liveNow = await checkYouTube(handle);
+          if (platform === "kick") liveNow = await checkKick(handle);
+          if (platform === "tiktok") liveNow = await checkTikTok(handle);
+        } catch {}
+
+        streams.push({ name, platform, handle, live: liveNow, lastPostId: null });
+        saveStreams(streams);
+
+        await interaction.reply({
+          embeds: [makeEmbed("Added", `${name} added to tracking.${liveNow ? " They appear to be live right now, so no first-time alert will be sent." : ""}`, "success")],
+          ephemeral: true
+        });
+        return;
+      }
+
+      if (cmd === "streams") {
+        const streams = loadStreams();
+        const desc = streams.length ? streams.map(s => `• ${s.name} (${s.platform}) → ${s.handle}`).join("\n") : "None";
+        await interaction.reply({ embeds: [makeEmbed("Tracked Streams", desc, "info")] });
+        return;
+      }
+
+      if (cmd === "removestream") {
+        const name = interaction.options.getString("name");
+        let streams = loadStreams();
+        streams = streams.filter(s => s.name.toLowerCase() !== name.toLowerCase());
+        saveStreams(streams);
+
+        await interaction.reply({ embeds: [makeEmbed("Removed", `${name} removed from tracking.`, "warn")] });
+        return;
+      }
+
+      if (cmd === "afk") {
+        const reason = interaction.options.getString("reason") || "AFK";
+        const afk = loadAFK();
+        afk[interaction.user.id] = reason;
+        saveAFK(afk);
+
+        await interaction.reply({ embeds: [makeEmbed("AFK Set", reason, "info")] });
+        return;
+      }
+
+      if (cmd === "snipe") {
+        const snipes = loadSnipes();
+        const snipe = snipes[interaction.channel.id];
+
+        if (!snipe) {
+          await interaction.reply({ embeds: [makeEmbed("Nothing to Snipe", "No recently deleted message in this channel.", "warn")], ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({
+          embeds: [makeEmbed("Sniped Message", `**Author:** ${snipe.author}\n**Content:** ${snipe.content}`, "info")]
+        });
+        return;
+      }
     }
 
     if (interaction.isButton()) {
       if (interaction.customId === "open_support_ticket") {
         const result = await createTicket(interaction.guild, interaction.user, "support");
+
         await interaction.reply({
           embeds: [makeEmbed(result.exists ? "Ticket Already Open" : "Support Ticket Opened", `${result.channel}`, result.exists ? "warn" : "success")],
           ephemeral: true
@@ -1044,6 +1202,7 @@ client.on(Events.InteractionCreate, async interaction => {
           await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can claim tickets.", "error")], ephemeral: true });
           return;
         }
+
         await interaction.reply({ embeds: [makeEmbed("Ticket Claimed", `${interaction.user} claimed this ticket.`, "success")] });
         await sendLog(interaction.guild, "Ticket Claimed", `${interaction.user.tag} claimed ${interaction.channel.name}.`, "info");
         return;
@@ -1054,13 +1213,17 @@ client.on(Events.InteractionCreate, async interaction => {
           await interaction.reply({ embeds: [makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
           return;
         }
+
         const messages = await interaction.channel.messages.fetch({ limit: 200 }).catch(() => null);
         const lines = [...(messages?.values() || [])]
           .reverse()
           .map(m => `[${new Date(m.createdTimestamp).toLocaleString()}] ${m.author.tag}: ${m.content || "[embed/attachment]"}`);
+
         await sendTranscript(interaction.guild, interaction.channel, lines);
+
         await interaction.reply({ embeds: [makeEmbed("Closing Ticket", "This ticket will be deleted in 5 seconds.", "warn")] });
         await sendLog(interaction.guild, "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn");
+
         setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
         return;
       }
@@ -1082,6 +1245,14 @@ client.on(Events.InteractionCreate, async interaction => {
 
         giveaway.entries.push(interaction.user.id);
         saveGiveaways(giveaways);
+
+        const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
+        if (msg) {
+          await msg.edit({
+            embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${giveaway.prize}\n**Ends:** <t:${Math.floor(giveaway.endsAt / 1000)}:R>\nEntries: **${giveaway.entries.length}**`, "info")],
+            components: msg.components
+          }).catch(() => {});
+        }
 
         await interaction.reply({ embeds: [makeEmbed("Entry Confirmed", "You joined the giveaway.", "success")], ephemeral: true });
         return;
@@ -1112,4 +1283,11 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN).catch(console.error);
+client.on("error", console.error);
+process.on("unhandledRejection", console.error);
+process.on("uncaughtException", console.error);
+
+console.log("ABOUT TO LOGIN...");
+client.login(process.env.DISCORD_TOKEN)
+  .then(() => console.log("LOGIN CALLED"))
+  .catch(err => console.error("LOGIN ERROR:", err));

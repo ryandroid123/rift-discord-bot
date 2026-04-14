@@ -1,46 +1,29 @@
 module.exports = {
   timezone: "Europe/London",
   autoRole: "Player",
+
   staffRoles: ["Founder", "Admin", "Moderator"],
 
+  roles: {
+    streamPing: "Stream"
+  },
+
   channels: {
-    support: "🎫┃support",
-    applications: "🧑‍💼┃staff-application",
+    support: "support",
+    applications: "staff-application",
     logs: "bot-logs",
     transcripts: "ticket-transcripts",
-    chat: "💬┃chat",
+    giveaways: "🎂┃giveaways",
+    streams: "📡┃stream-alerts",
+    posts: "🎥┃posts",
     landing: "🛬┃landing",
     takeoff: "🛫┃takeoff",
-    rules: "🏫┃rules"
+    rules: "🏫┃rules",
+    chat: "💬┃chat"
   },
 
   categories: {
-    tickets: "Tickets"
-  },
-
-  automod: {
-    blockedWords: [
-      "discord.gg/",
-      "discord.com/invite/",
-      "gg/",
-      "nigg",
-      "faggot",
-      "kys"
-    ],
-    maxMentions: 5,
-    capsThreshold: 0.72,
-    capsMinLetters: 12,
-    repeatWindowMs: 8000,
-    repeatLimit: 4,
-    suspiciousLinkPatterns: ["grabify", "iplogger", "bit.ly", "tinyurl", "t.ly", "goo.gl"],
-    capsBypassRoles: ["Founder"]
-  },
-
-  antinuke: {
-    threshold: 3,
-    windowMs: 30000,
-    punishmentTimeoutMs: 7 * 24 * 60 * 60 * 1000,
-    lockdownRoleNames: ["Founder", "Admin", "Moderator"]
+    tickets: "tickets"
   },
 
   rules: [
@@ -55,6 +38,41 @@ module.exports = {
     "Do not evade punishments.",
     "Staff decisions are final."
   ],
+
+  automod: {
+    blockedWords: [
+      "discord.gg/",
+      "discord.com/invite/",
+      "gg/",
+      "nigg",
+      "faggot",
+      "kys"
+    ],
+    suspiciousLinkPatterns: [
+      "grabify",
+      "iplogger",
+      "bit.ly",
+      "tinyurl",
+      "t.ly",
+      "goo.gl"
+    ],
+    maxMentions: 5,
+    capsThreshold: 0.72,
+    capsMinLetters: 12,
+    repeatWindowMs: 8000,
+    repeatLimit: 4,
+    capsBypassRoles: ["Founder"]
+  },
+
+  antinuke: {
+    threshold: 3,
+    windowMs: 30000,
+    punishmentTimeoutMs: 7 * 24 * 60 * 60 * 1000
+  },
+
+  social: {
+    checkIntervalMs: 120000
+  },
 
   riddle: {
     hour: 9,

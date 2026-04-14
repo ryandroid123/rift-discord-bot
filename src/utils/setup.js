@@ -1,8 +1,8 @@
 const { ChannelType, PermissionsBitField } = require("discord.js");
 const config = require("../config");
 
-function getChannelByName(guild, name, type = ChannelType.GuildText) {
-  return guild.channels.cache.find(c => c.name === name && c.type === type) || null;
+function getChannelByName(guild, name, type = null) {
+  return guild.channels.cache.find(c => c.name === name && (type ? c.type === type : true)) || null;
 }
 
 function getCategoryByName(guild, name) {

@@ -1,150 +1,141 @@
-const { SlashCommandBuilder, PermissionFlagsBits } = require("discord.js");
-
 module.exports = [
-  new SlashCommandBuilder().setName("ping").setDescription("Check if the bot is online.").toJSON(),
-  new SlashCommandBuilder().setName("allcommands").setDescription("Show all bot commands.").toJSON(),
+  { name: "ping", description: "Check if the bot is online." },
+  { name: "allcommands", description: "Show all bot commands." },
 
-  new SlashCommandBuilder().setName("setup-support-panel").setDescription("Post the support ticket panel.").toJSON(),
-  new SlashCommandBuilder().setName("setup-application-panel").setDescription("Post the application ticket panel.").toJSON(),
-  new SlashCommandBuilder().setName("close").setDescription("Close the current ticket.").setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels).toJSON(),
+  { name: "setup-support-panel", description: "Post the support ticket panel." },
+  { name: "setup-application-panel", description: "Post the application ticket panel." },
+  { name: "close", description: "Close the current ticket." },
 
-  new SlashCommandBuilder()
-    .setName("timeout")
-    .setDescription("Timeout a member.")
-    .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
-    .addStringOption(o => o.setName("duration").setDescription("10m, 1h, 1d").setRequired(true))
-    .addStringOption(o => o.setName("reason").setDescription("Reason"))
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("untimeout")
-    .setDescription("Remove a timeout from a member.")
-    .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
-    .addStringOption(o => o.setName("reason").setDescription("Reason"))
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("ban")
-    .setDescription("Ban a member.")
-    .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
-    .addStringOption(o => o.setName("reason").setDescription("Reason"))
-    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("kick")
-    .setDescription("Kick a member.")
-    .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
-    .addStringOption(o => o.setName("reason").setDescription("Reason"))
-    .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("purge")
-    .setDescription("Delete messages.")
-    .addIntegerOption(o => o.setName("amount").setDescription("1-100").setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("lock")
-    .setDescription("Lock the current channel.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("unlock")
-    .setDescription("Unlock the current channel.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("slowmode")
-    .setDescription("Set channel slowmode.")
-    .addIntegerOption(o => o.setName("seconds").setDescription("0-21600").setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("warn")
-    .setDescription("Warn a member.")
-    .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
-    .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(true))
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("warnings")
-    .setDescription("See a member's warnings.")
-    .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("invites")
-    .setDescription("Check tracked invites for yourself or another user.")
-    .addUserOption(o => o.setName("user").setDescription("User"))
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("giveaway")
-    .setDescription("Create a giveaway in the current channel.")
-    .addStringOption(o => o.setName("duration").setDescription("10m, 1h, 1d").setRequired(true))
-    .addStringOption(o => o.setName("prize").setDescription("Prize").setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("reroll")
-    .setDescription("Reroll a giveaway.")
-    .addStringOption(o => o.setName("messageid").setDescription("Giveaway message ID").setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("userinfo")
-    .setDescription("Show info about a user.")
-    .addUserOption(o => o.setName("user").setDescription("User"))
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("serverstats")
-    .setDescription("Show server stats.")
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("poll")
-    .setDescription("Create a yes/no poll.")
-    .addStringOption(o => o.setName("question").setDescription("Question").setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("sayembed")
-    .setDescription("Send a custom embed.")
-    .addStringOption(o => o.setName("title").setDescription("Title").setRequired(true))
-    .addStringOption(o => o.setName("description").setDescription("Description").setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("avatar")
-    .setDescription("Show a user's avatar.")
-    .addUserOption(o => o.setName("user").setDescription("User"))
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("roleinfo")
-    .setDescription("Show info about a role.")
-    .addRoleOption(o => o.setName("role").setDescription("Role").setRequired(true))
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("suggest")
-    .setDescription("Post a suggestion.")
-    .addStringOption(o => o.setName("idea").setDescription("Your suggestion").setRequired(true))
-    .toJSON(),
-
-  new SlashCommandBuilder()
-    .setName("riddle")
-    .setDescription("Post a random riddle.")
-    .toJSON()
+  {
+    name: "timeout",
+    description: "Timeout a member.",
+    options: [
+      { name: "user", type: 6, required: true, description: "User" },
+      { name: "duration", type: 3, required: true, description: "10m, 1h, 1d" },
+      { name: "reason", type: 3, required: false, description: "Reason" }
+    ]
+  },
+  {
+    name: "untimeout",
+    description: "Remove a timeout from a member.",
+    options: [
+      { name: "user", type: 6, required: true, description: "User" },
+      { name: "reason", type: 3, required: false, description: "Reason" }
+    ]
+  },
+  {
+    name: "ban",
+    description: "Ban a member.",
+    options: [
+      { name: "user", type: 6, required: true, description: "User" },
+      { name: "reason", type: 3, required: false, description: "Reason" }
+    ]
+  },
+  {
+    name: "kick",
+    description: "Kick a member.",
+    options: [
+      { name: "user", type: 6, required: true, description: "User" },
+      { name: "reason", type: 3, required: false, description: "Reason" }
+    ]
+  },
+  {
+    name: "purge",
+    description: "Delete messages.",
+    options: [{ name: "amount", type: 4, required: true, description: "1-100" }]
+  },
+  { name: "lock", description: "Lock the current channel." },
+  { name: "unlock", description: "Unlock the current channel." },
+  {
+    name: "slowmode",
+    description: "Set channel slowmode.",
+    options: [{ name: "seconds", type: 4, required: true, description: "0-21600" }]
+  },
+  {
+    name: "warn",
+    description: "Warn a member.",
+    options: [
+      { name: "user", type: 6, required: true, description: "User" },
+      { name: "reason", type: 3, required: true, description: "Reason" }
+    ]
+  },
+  {
+    name: "warnings",
+    description: "See a member's warnings.",
+    options: [{ name: "user", type: 6, required: true, description: "User" }]
+  },
+  {
+    name: "invites",
+    description: "Check tracked invites for yourself or another user.",
+    options: [{ name: "user", type: 6, required: false, description: "User" }]
+  },
+  {
+    name: "giveaway",
+    description: "Create a giveaway in the current channel.",
+    options: [
+      { name: "duration", type: 3, required: true, description: "10m, 1h, 1d" },
+      { name: "prize", type: 3, required: true, description: "Prize" }
+    ]
+  },
+  {
+    name: "reroll",
+    description: "Reroll a giveaway.",
+    options: [{ name: "messageid", type: 3, required: true, description: "Giveaway message ID" }]
+  },
+  {
+    name: "userinfo",
+    description: "Show info about a user.",
+    options: [{ name: "user", type: 6, required: false, description: "User" }]
+  },
+  { name: "serverstats", description: "Show server stats." },
+  {
+    name: "poll",
+    description: "Create a yes/no poll.",
+    options: [{ name: "question", type: 3, required: true, description: "Question" }]
+  },
+  {
+    name: "sayembed",
+    description: "Send a custom embed.",
+    options: [
+      { name: "title", type: 3, required: true, description: "Title" },
+      { name: "description", type: 3, required: true, description: "Description" }
+    ]
+  },
+  {
+    name: "avatar",
+    description: "Show a user's avatar.",
+    options: [{ name: "user", type: 6, required: false, description: "User" }]
+  },
+  {
+    name: "roleinfo",
+    description: "Show info about a role.",
+    options: [{ name: "role", type: 8, required: true, description: "Role" }]
+  },
+  {
+    name: "suggest",
+    description: "Post a suggestion.",
+    options: [{ name: "idea", type: 3, required: true, description: "Your suggestion" }]
+  },
+  { name: "riddle", description: "Post a random riddle." },
+  {
+    name: "addstream",
+    description: "Add a streamer/platform watcher.",
+    options: [
+      { name: "name", type: 3, required: true, description: "Display name" },
+      { name: "platform", type: 3, required: true, description: "twitch/youtube/kick/tiktok/x" },
+      { name: "handle", type: 3, required: true, description: "username or channel id" }
+    ]
+  },
+  { name: "streams", description: "List all stream trackers." },
+  {
+    name: "removestream",
+    description: "Remove a stream tracker.",
+    options: [{ name: "name", type: 3, required: true, description: "Display name" }]
+  },
+  {
+    name: "afk",
+    description: "Set your AFK status.",
+    options: [{ name: "reason", type: 3, required: false, description: "Reason" }]
+  },
+  { name: "snipe", description: "Show the last deleted message in this channel." }
 ];

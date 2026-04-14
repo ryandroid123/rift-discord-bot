@@ -426,27 +426,6 @@ function getWarnings(guildId, userId) {
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-
-  try {
-    console.log("Registering commands...");
-    const result = await Promise.race([
-      rest.put(
-        Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-        { body: commands }
-      ),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("REST timed out after 10s")), 10000)
-      )
-    ]);
-    console.log("Commands registered:", Array.isArray(result) ? result.length : result);
-  } catch (err) {
-    console.error("REGISTER ERROR:", err.message);
-    console.error("STATUS:", err.status);
-    console.error("RAW ERROR:", JSON.stringify(err.rawError));
-  }
-});
-
 client.on(Events.GuildMemberAdd, async member => {
   const role = getRoleByName(member.guild, config.autoRole);
   if (role) {

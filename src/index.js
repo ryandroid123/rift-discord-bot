@@ -427,7 +427,7 @@ client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-client.on(Events.GuildMemberAdd, async member => {
+client.on(Events.GuildMemberAdd, async member => { 
   const role = getRoleByName(member.guild, config.autoRole);
   if (role) {
     await member.roles.add(role).catch(() => {});

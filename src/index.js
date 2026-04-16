@@ -561,14 +561,53 @@ client.on(Events.MessageCreate, async message => {
 
   const key = `${message.guild.id}:${message.author.id}`;
   const now = Date.now();
-  const arr = (spamCache.get(key) || []).filter(x => now - x.time <= config.automod.repeatWindowMs);
+  const arr = (spamCache.get(key) || []).filter(x => now - x.time <= 3000);
   arr.push({ time: now, text: message.content });
   spamCache.set(key, arr);
 
   const repeats = arr.filter(x => x.text === message.content).length;
-  if (repeats >= config.automod.repeatLimit) {
+  const isRepeatSpam = repeats >= 3;
+  const isRapidSpam = arr.length >= 5;
+
+  if (isRepeatSpam || isRapidSpam) {
+    spamCache.set(key, []);
     await message.delete().catch(() => {});
-    await sendLog(message.guild, "AutoMod", `Repeated spam removed from ${message.author.tag}.`, "warn");
+
+    const offences = addWarning(message.guild.id, message.author.id, "AutoMod", "Spamming");
+    const member = message.member;
+    const reason = isRepeatSpam ? "Repeated identical messages" : "Sending messages too fast";
+
+    let actionText = "";
+    let dmText = "";
+
+    if (offences === 1) {
+      actionText = "Warned";
+      dmText = `You have been **warned** in **${message.guild.name}** for spamming.\nReason: ${reason}\n\nPlease stop or further action will be taken.`;
+    } else if (offences === 2) {
+      actionText = "Timed out for 5 minutes";
+      dmText = `You have been **timed out for 5 minutes** in **${message.guild.name}** for spamming.\nReason: ${reason}\n\nThis is your second offence.`;
+      if (member?.moderatable) await member.timeout(5 * 60 * 1000, "AutoMod: Spamming").catch(() => {});
+    } else if (offences === 3) {
+      actionText = "Timed out for 1 hour";
+      dmText = `You have been **timed out for 1 hour** in **${message.guild.name}** for spamming.\nReason: ${reason}\n\nThis is your third offence.`;
+      if (member?.moderatable) await member.timeout(60 * 60 * 1000, "AutoMod: Spamming").catch(() => {});
+    } else {
+      actionText = "Banned";
+      dmText = `You have been **banned** from **${message.guild.name}** for repeated spamming.\nReason: ${reason}\n\nTo appeal your ban, DM @kz1m or @NotLuigiBro on Discord.`;
+      await message.guild.members.ban(message.author.id, { reason: "AutoMod: Repeated spamming" }).catch(() => {});
+    }
+
+    await message.author.send({
+      embeds: [makeEmbed("AutoMod Action", dmText, "error")]
+    }).catch(() => {});
+
+    await sendLog(message.guild, "AutoMod Spam", `${message.author.tag} was actioned for spamming.`, "warn", [
+      { name: "Action", value: actionText, inline: true },
+      { name: "Offences", value: String(offences), inline: true },
+      { name: "Reason", value: reason, inline: true }
+    ]);
+
+    return;
   }
 });
 

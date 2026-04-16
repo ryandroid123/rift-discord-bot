@@ -88,11 +88,17 @@ module.exports = [
     options: [{ name: "user", type: 6, required: false, description: "User" }]
   },
   { name: "serverstats", description: "Show server stats." },
-  {
-    name: "poll",
-    description: "Create a yes/no poll.",
-    options: [{ name: "question", type: 3, required: true, description: "Question" }]
-  },
+ {
+  name: "poll",
+  description: "Create a custom poll.",
+  options: [
+    { name: "question", type: 3, required: true, description: "Question" },
+    { name: "answer1", type: 3, required: true, description: "First answer" },
+    { name: "answer2", type: 3, required: true, description: "Second answer" },
+    { name: "answer3", type: 3, required: false, description: "Third answer" },
+    { name: "answer4", type: 3, required: false, description: "Fourth answer" }
+  ]
+},
   {
     name: "sayembed",
     description: "Send a custom embed.",

@@ -1061,16 +1061,36 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
       }
 
-      if (cmd === "poll") {
-        const question = interaction.options.getString("question");
-        const msg = await interaction.channel.send({ embeds: [makeEmbed("📊 Poll", question, "info")] });
+if (cmd === "poll") {
+  const question = interaction.options.getString("question");
+  const answers = [
+    interaction.options.getString("answer1"),
+    interaction.options.getString("answer2"),
+    interaction.options.getString("answer3"),
+    interaction.options.getString("answer4")
+  ].filter(Boolean);
 
-        await msg.react("✅").catch(() => {});
-        await msg.react("❌").catch(() => {});
+  const emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"];
 
-        await interaction.reply({ embeds: [makeEmbed("Poll Created", "Your poll has been posted.", "success")], ephemeral: true });
-        return;
-      }
+  const description = answers
+    .map((a, i) => `${emojis[i]} ${a}`)
+    .join("\n");
+
+  const msg = await interaction.channel.send({
+    embeds: [makeEmbed("📊 Poll", `**${question}**\n\n${description}`, "info")]
+  });
+
+  for (let i = 0; i < answers.length; i++) {
+    await msg.react(emojis[i]).catch(() => {});
+  }
+
+  await interaction.reply({
+    embeds: [makeEmbed("Poll Created", "Your poll has been posted.", "success")],
+    ephemeral: true
+  });
+
+  return;
+}
 
       if (cmd === "sayembed") {
         const title = interaction.options.getString("title");

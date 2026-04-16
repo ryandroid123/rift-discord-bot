@@ -425,6 +425,15 @@ function getWarnings(guildId, userId) {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  const giveaways = loadGiveaways();
+  for (const g of giveaways) {
+    if (!g.ended) {
+      scheduleGiveaway(g);
+    }
+  }
+
+  console.log(`Rescheduled ${giveaways.length} giveaways`);
 });
 
 client.on(Events.GuildMemberAdd, async member => { 

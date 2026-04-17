@@ -428,12 +428,15 @@ client.once(Events.ClientReady, async () => {
 
   const giveaways = loadGiveaways();
   for (const g of giveaways) {
-    if (!g.ended) {
-      scheduleGiveaway(g);
-    }
+    if (!g.ended) scheduleGiveaway(g);
   }
-
   console.log(`Rescheduled ${giveaways.length} giveaways`);
+
+  setInterval(() => {
+    checkStreams(client, config, makeEmbed).catch(() => {});
+  }, 2 * 60 * 1000);
+
+  startRiddleLoop();
 });
 
 client.on(Events.GuildMemberAdd, async member => { 
@@ -1020,12 +1023,22 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "reroll") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only staff can reroll giveaways.", "error")], ephemeral: true });
+          return;
+        }
+
         const messageId = interaction.options.getString("messageid");
         const giveaways = loadGiveaways();
         const giveaway = giveaways.find(g => g.messageId === messageId);
 
-        if (!giveaway || !giveaway.entries.length) {
-          await interaction.reply({ embeds: [makeEmbed("Error", "That giveaway was not found or has no entries.", "error")], ephemeral: true });
+        if (!giveaway) {
+          await interaction.reply({ embeds: [makeEmbed("Error", "Giveaway not found.", "error")], ephemeral: true });
+          return;
+        }
+
+        if (!giveaway.entries.length) {
+          await interaction.reply({ embeds: [makeEmbed("Error", "No entries to reroll.", "error")], ephemeral: true });
           return;
         }
 
@@ -1033,7 +1046,12 @@ client.on(Events.InteractionCreate, async interaction => {
         giveaway.winnerId = winnerId;
         saveGiveaways(giveaways);
 
-        await interaction.reply({ embeds: [makeEmbed("Giveaway Rerolled", `New winner: <@${winnerId}>`, "success")] });
+        await interaction.channel.send({
+          embeds: [makeEmbed("🎉 Giveaway Rerolled", `New winner: <@${winnerId}>
+**Prize:** ${giveaway.prize}`, "success")]
+        });
+
+        await interaction.reply({ embeds: [makeEmbed("Rerolled", `New winner is <@${winnerId}>`, "success")], ephemeral: true });
         return;
       }
 

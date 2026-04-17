@@ -46,6 +46,7 @@ const {
   panicLockdown
 } = require("./utils/setup");
 const { checkStreams, loadStreams, saveStreams, checkTwitch, checkYouTube, checkKick, checkTikTok } = require("./utils/socials");
+const { createGuildBackupSnapshot, restoreGuildBackupSnapshot } = require("./utils/backup");
 
 const client = new Client({
   intents: [
@@ -67,6 +68,7 @@ const afkPath = resolveDataPath("afk.json");
 const snipePath = resolveDataPath("snipe.json");
 const automodPath = resolveDataPath("automod.json");
 const moderationLogPath = resolveDataPath("moderation-log.json");
+const backupsPath = resolveDataPath("backups.json");
 const transcriptDir = resolveDataPath("transcripts");
 
 ensureDataFile("giveaways.json", []);
@@ -78,6 +80,7 @@ ensureDataFile("afk.json", {});
 ensureDataFile("snipe.json", {});
 ensureDataFile("automod.json", {});
 ensureDataFile("moderation-log.json", []);
+ensureDataFile("backups.json", []);
 if (!fs.existsSync(transcriptDir)) fs.mkdirSync(transcriptDir, { recursive: true });
 
 const automodCache = new Map();
@@ -85,9 +88,24 @@ const giveawayTimers = new Map();
 const inviteCache = new Map();
 const memberInviteStats = new Map();
 const joinRaidCache = new Map();
+const logQueueByChannel = new Map();
+const streamCheckState = { running: false };
+const antiNukeDedupe = new Map();
 
 function logChannel(guild) {
   return getChannelByName(guild, config.channels.logs);
+}
+
+function getLogChannelByType(guild, kind = "general") {
+  const channels = config.channels || {};
+  const map = {
+    general: channels.logs,
+    moderation: channels.moderationLogs || channels.logs,
+    security: channels.securityLogs || channels.logs,
+    message: channels.messageLogs || channels.logs,
+    member: channels.memberLogs || channels.logs
+  };
+  return getChannelByName(guild, map[kind] || channels.logs);
 }
 
 function transcriptChannel(guild) {
@@ -132,6 +150,27 @@ function loadSnipes() {
 
 function saveSnipes(data) {
   writeJson(snipePath, data);
+}
+
+function loadBackups() {
+  return readJson(backupsPath, []);
+}
+
+function saveBackups(data) {
+  writeJson(backupsPath, data);
+}
+
+function formatBackupList(backups, guildId) {
+  const scoped = backups.filter(b => b.guildId === guildId).slice(0, 10);
+  if (!scoped.length) return "No backups found for this server.";
+  return scoped
+    .map(b => {
+      const created = `<t:${Math.floor((b.createdAt || 0) / 1000)}:R>`;
+      const roles = b.stats?.roleCount ?? (b.roles?.length || 0);
+      const channels = b.stats?.channelCount ?? (b.channels?.length || 0);
+      return `• \`${b.id}\` • ${created} • roles: ${roles}, channels: ${channels}`;
+    })
+    .join("\n");
 }
 
 function loadAutomodState() {
@@ -281,6 +320,8 @@ function storeAutoModHistory(key, history, item) {
 
 function detectAutoModTrigger(message, settings) {
   const content = message.content || "";
+  const minAggressiveLen = config.automod?.minMessageLengthForAggressiveChecks ?? 6;
+  const aggressiveEligible = content.length >= minAggressiveLen;
   const lower = content.toLowerCase();
   const links = getMessageLinks(content);
   const attachments = getAttachmentFingerprints(message);
@@ -346,19 +387,19 @@ function detectAutoModTrigger(message, settings) {
     return { rule: "line-break-flood", reason: "Too many line breaks", evidence: `${lineBreaks} line breaks` };
   }
 
-  if (content.length >= settings.maxChars) {
+  if (aggressiveEligible && content.length >= settings.maxChars) {
     return { rule: "char-flood", reason: "Message too long", evidence: `${content.length} characters` };
   }
 
-  if (new RegExp(`(.)\\1{${Math.max(2, settings.charFloodRepeat)}}`).test(content)) {
+  if (aggressiveEligible && new RegExp(`(.)\\1{${Math.max(2, settings.charFloodRepeat)}}`).test(content)) {
     return { rule: "character-repeat", reason: "Character flooding detected", evidence: "Repeated character sequence" };
   }
 
-  if (zalgoMarks >= settings.maxZalgoMarks) {
+  if (aggressiveEligible && zalgoMarks >= settings.maxZalgoMarks) {
     return { rule: "zalgo-obfuscation", reason: "Excessive combining characters", evidence: `${zalgoMarks} combining marks` };
   }
 
-  if (detectSuspiciousUnicode(content)) {
+  if (aggressiveEligible && detectSuspiciousUnicode(content)) {
     return { rule: "unicode-obfuscation", reason: "Suspicious Unicode obfuscation detected", evidence: "BiDi/zero-width/confusable Unicode patterns" };
   }
 
@@ -432,7 +473,7 @@ async function applyAutoModAction(message, trigger) {
     embeds: [makeEmbed("AutoMod Action", `Rule: **${trigger.rule}**\nReason: ${trigger.reason}\nAction: **${actionDetail}**`, "warn")]
   }).catch(() => {});
 
-  await sendLog(message.guild, "AutoMod Action", `${message.author.tag} triggered ${trigger.rule}.`, "warn", [
+  await sendTypedLog(message.guild, "moderation", "AutoMod Action", `${message.author.tag} triggered ${trigger.rule}.`, "warn", [
     { name: "Rule", value: trigger.rule, inline: true },
     { name: "Action", value: action, inline: true },
     { name: "Warnings", value: String(offences), inline: true },
@@ -476,9 +517,32 @@ function canUseModCommand(member) {
 }
 
 async function sendLog(guild, title, description, type = "info", fields = []) {
-  const ch = logChannel(guild);
+  const ch = getLogChannelByType(guild, "general");
   if (!ch) return;
-  await ch.send({ embeds: [makeEmbed(title, description, type, fields)] }).catch(() => {});
+  await queueLogSend(ch, { embeds: [makeEmbed(title, description, type, fields)] });
+}
+
+async function sendTypedLog(guild, kind, title, description, type = "info", fields = []) {
+  const ch = getLogChannelByType(guild, kind);
+  if (!ch) return;
+  await queueLogSend(ch, { embeds: [makeEmbed(title, description, type, fields)] });
+}
+
+async function queueLogSend(channel, payload) {
+  const channelId = channel.id;
+  const queue = logQueueByChannel.get(channelId) || [];
+  queue.push(payload);
+  logQueueByChannel.set(channelId, queue);
+  if (queue.processing) return;
+  queue.processing = true;
+
+  while (queue.length) {
+    const next = queue.shift();
+    await channel.send(next).catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 350));
+  }
+
+  queue.processing = false;
 }
 
 async function sendTranscript(guild, ticketChannel, lines) {
@@ -736,6 +800,8 @@ function recordAntiNuke(guildId, userId, action, settings) {
 }
 
 async function antiNukeCheck(guild, executorId, action, extra = {}) {
+  if (shouldSkipAntiNukeDuplicate(guild.id, executorId, action, extra.target || "")) return;
+
   const settings = getAntiNukeSettings();
   const member = await guild.members.fetch(executorId).catch(() => null);
   if (!member) return;
@@ -744,7 +810,7 @@ async function antiNukeCheck(guild, executorId, action, extra = {}) {
 
   const counts = recordAntiNuke(guild.id, executorId, action, settings);
 
-  await sendLog(guild, "Anti-Nuke Alert", `Suspicious action detected: ${action}`, "warn", [
+  await sendTypedLog(guild, "security", "Anti-Nuke Alert", `Suspicious action detected: ${action}`, "warn", [
     { name: "User", value: member.user.tag, inline: true },
     { name: "Action Count", value: String(counts.actionCount), inline: true },
     { name: "Global Count", value: String(counts.globalCount), inline: true },
@@ -781,7 +847,7 @@ async function antiNukeCheck(guild, executorId, action, extra = {}) {
     await panicLockdown(guild, "Anti-nuke lockdown triggered").catch(() => {});
   }
 
-  await sendLog(guild, "Anti-Nuke Action", `${member.user.tag} hit anti-nuke thresholds. Emergency response executed.`, "error", [
+  await sendTypedLog(guild, "security", "Anti-Nuke Action", `${member.user.tag} hit anti-nuke thresholds. Emergency response executed.`, "error", [
     { name: "Action", value: action, inline: true },
     { name: "Action Count", value: String(counts.actionCount), inline: true },
     { name: "Global Count", value: String(counts.globalCount), inline: true }
@@ -820,7 +886,7 @@ async function checkJoinRaid(member) {
 
   if (timestamps.length < joinLimit) return;
 
-  await sendLog(member.guild, "Anti-Raid Alert", `Join spike detected: ${timestamps.length} joins in ${Math.floor(windowMs / 1000)}s.`, "warn");
+  await sendTypedLog(member.guild, "security", "Anti-Raid Alert", `Join spike detected: ${timestamps.length} joins in ${Math.floor(windowMs / 1000)}s.`, "warn");
   appendModerationLog({
     type: "anti-raid",
     guildId: member.guild.id,
@@ -831,15 +897,37 @@ async function checkJoinRaid(member) {
 
   if (action === "lockdown") {
     await panicLockdown(member.guild, "Anti-raid lockdown triggered").catch(() => {});
-    await sendLog(member.guild, "Anti-Raid Action", "Panic lockdown triggered by join spike.", "error");
+    await sendTypedLog(member.guild, "security", "Anti-Raid Action", "Panic lockdown triggered by join spike.", "error");
   } else if (action === "slowmode") {
     const chat = getChannelByName(member.guild, config.channels.chat);
     const seconds = antiRaid.slowmodeSeconds ?? 10;
     if (chat?.manageable) {
       await chat.setRateLimitPerUser(seconds).catch(() => {});
-      await sendLog(member.guild, "Anti-Raid Action", `Applied ${seconds}s slowmode to ${chat}.`, "warn");
+      await sendTypedLog(member.guild, "security", "Anti-Raid Action", `Applied ${seconds}s slowmode to ${chat}.`, "warn");
     }
   }
+}
+
+async function runStreamChecksSafely() {
+  if (streamCheckState.running) return;
+  streamCheckState.running = true;
+  try {
+    await checkStreams(client, config, makeEmbed);
+  } catch {}
+  streamCheckState.running = false;
+}
+
+function shouldSkipAntiNukeDuplicate(guildId, executorId, action, target = "") {
+  const key = `${guildId}:${executorId}:${action}:${target}`;
+  const now = Date.now();
+  const last = antiNukeDedupe.get(key) || 0;
+  antiNukeDedupe.set(key, now);
+
+  for (const [k, t] of antiNukeDedupe.entries()) {
+    if (now - t > 30000) antiNukeDedupe.delete(k);
+  }
+
+  return now - last < 2500;
 }
 
 function londonNowParts() {
@@ -916,6 +1004,10 @@ function getWarnings(guildId, userId) {
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Data directory: ${dataDir} (source: ${dataDirSource})`);
+  const storedInviteCounts = loadInviteCountsFromState();
+  for (const [key, value] of storedInviteCounts.entries()) {
+    memberInviteStats.set(key, value);
+  }
 
   const giveaways = loadGiveaways();
   let scheduled = 0;
@@ -932,10 +1024,14 @@ client.once(Events.ClientReady, async () => {
   }
   console.log(`Giveaway recovery complete. Scheduled: ${scheduled}, ended on startup: ${recoveredEnded}, total records: ${giveaways.length}`);
 
+  for (const guild of client.guilds.cache.values()) {
+    cacheInvitesForGuild(guild).catch(() => {});
+  }
+
   setInterval(() => {
-    checkStreams(client, config, makeEmbed).catch(() => {});
+    runStreamChecksSafely().catch(() => {});
   }, config.social?.checkIntervalMs || 2 * 60 * 1000);
-  checkStreams(client, config, makeEmbed).catch(() => {});
+  runStreamChecksSafely().catch(() => {});
 
   startRiddleLoop();
 });
@@ -968,7 +1064,7 @@ client.on(Events.GuildMemberAdd, async member => {
     inviteCache.set(member.guild.id, new Map(newInvites.map(inv => [inv.code, inv.uses || 0])));
   }
 
-  await sendLog(member.guild, "Member Joined", `${member.user.tag} joined and received the ${config.autoRole} role.`, "success", [
+  await sendTypedLog(member.guild, "member", "Member Joined", `${member.user.tag} joined and received the ${config.autoRole} role.`, "success", [
     { name: "Invited By", value: inviterText }
   ]);
 
@@ -997,7 +1093,15 @@ client.on(Events.GuildMemberAdd, async member => {
 });
 
 client.on(Events.GuildMemberRemove, async member => {
-  await sendLog(member.guild, "Member Left", `${member.user.tag} left the server.`, "warn");
+  const kickEntry = await fetchAuditEntry(member.guild, AuditLogEvent.MemberKick, member.id, 12000);
+  if (kickEntry?.executor) {
+    await sendTypedLog(member.guild, "member", "Member Kicked", `${member.user.tag} was kicked from the server.`, "error", [
+      { name: "Moderator", value: kickEntry.executor.tag, inline: true },
+      { name: "Reason", value: kickEntry.reason || "No reason provided", inline: true }
+    ]);
+  } else {
+    await sendTypedLog(member.guild, "member", "Member Left", `${member.user.tag} left the server.`, "warn");
+  }
 
   const takeoff = getChannelByName(member.guild, config.channels.takeoff);
   if (takeoff) {
@@ -1022,10 +1126,30 @@ client.on(Events.MessageDelete, async message => {
     time: Date.now()
   };
   saveSnipes(snipes);
+
+  await sendTypedLog(message.guild, "message", "Message Deleted", `A message by ${message.author.tag} was deleted in ${message.channel}.`, "warn", [
+    { name: "Author", value: message.author.tag, inline: true },
+    { name: "Channel", value: `${message.channel}`, inline: true },
+    { name: "Content", value: (message.content || "[embed/attachment]").slice(0, 1000) }
+  ]);
+});
+
+client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
+  if (!newMessage.guild || !newMessage.author || newMessage.author.bot) return;
+  const oldContent = oldMessage?.content || "";
+  const newContent = newMessage?.content || "";
+  if (!oldContent || oldContent === newContent) return;
+
+  await sendTypedLog(newMessage.guild, "message", "Message Edited", `${newMessage.author.tag} edited a message in ${newMessage.channel}.`, "info", [
+    { name: "Before", value: oldContent.slice(0, 1000) },
+    { name: "After", value: newContent.slice(0, 1000) }
+  ]);
 });
 
 client.on(Events.MessageCreate, async message => {
   if (!message.guild || message.author.bot) return;
+  if (Date.now() - message.createdTimestamp > 15000) return;
+  if (!message.content && !message.attachments?.size) return;
 
   const afk = loadAFK();
   if (afk[message.author.id]) {
@@ -1050,7 +1174,7 @@ client.on(Events.MessageCreate, async message => {
   return;
 });
 
-async function fetchExecutor(guild, type, targetId = null, maxAgeMs = 30000) {
+async function fetchAuditEntry(guild, type, targetId = null, maxAgeMs = 30000) {
   const logs = await guild.fetchAuditLogs({ type, limit: 6 }).catch(() => null);
   if (!logs?.entries?.size) return null;
 
@@ -1059,27 +1183,32 @@ async function fetchExecutor(guild, type, targetId = null, maxAgeMs = 30000) {
     const created = entry.createdTimestamp || 0;
     if (now - created > maxAgeMs) continue;
     if (targetId && entry.targetId && entry.targetId !== targetId) continue;
-    return entry.executorId || null;
+    return entry;
   }
 
   return null;
 }
 
+async function fetchExecutor(guild, type, targetId = null, maxAgeMs = 30000) {
+  const entry = await fetchAuditEntry(guild, type, targetId, maxAgeMs);
+  return entry?.executorId || null;
+}
+
 client.on(Events.ChannelDelete, async channel => {
   if (channel.guild) {
-    await sendLog(channel.guild, "Channel Deleted", `${channel.name} was deleted.`, "error");
+    await sendTypedLog(channel.guild, "security", "Channel Deleted", `${channel.name} was deleted.`, "error");
     const executorId = await fetchExecutor(channel.guild, AuditLogEvent.ChannelDelete, channel.id);
     if (executorId) {
       await antiNukeCheck(channel.guild, executorId, "channelDelete", { target: channel.name });
     } else {
-      await sendLog(channel.guild, "Anti-Nuke Notice", "Could not attribute channel delete from audit logs.", "warn");
+      await sendTypedLog(channel.guild, "security", "Anti-Nuke Notice", "Could not attribute channel delete from audit logs.", "warn");
     }
   }
 });
 
 client.on(Events.ChannelCreate, async channel => {
   if (channel.guild) {
-    await sendLog(channel.guild, "Channel Created", `${channel.name} was created.`, "success");
+    await sendTypedLog(channel.guild, "moderation", "Channel Created", `${channel.name} was created.`, "success");
     const executorId = await fetchExecutor(channel.guild, AuditLogEvent.ChannelCreate, channel.id);
     if (executorId) {
       await antiNukeCheck(channel.guild, executorId, "channelCreate", { target: channel.name });
@@ -1089,13 +1218,13 @@ client.on(Events.ChannelCreate, async channel => {
 
 client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
   if (newChannel.guild && oldChannel.name !== newChannel.name) {
-    await sendLog(newChannel.guild, "Channel Updated", `${oldChannel.name} renamed to ${newChannel.name}.`, "info");
+    await sendTypedLog(newChannel.guild, "moderation", "Channel Updated", `${oldChannel.name} renamed to ${newChannel.name}.`, "info");
   }
 });
 
 client.on(Events.RoleDelete, async role => {
   if (role.guild) {
-    await sendLog(role.guild, "Role Deleted", `${role.name} was deleted.`, "error");
+    await sendTypedLog(role.guild, "security", "Role Deleted", `${role.name} was deleted.`, "error");
     const executorId = await fetchExecutor(role.guild, AuditLogEvent.RoleDelete, role.id);
     if (executorId) await antiNukeCheck(role.guild, executorId, "roleDelete", { target: role.name });
   }
@@ -1103,7 +1232,7 @@ client.on(Events.RoleDelete, async role => {
 
 client.on(Events.RoleCreate, async role => {
   if (role.guild) {
-    await sendLog(role.guild, "Role Created", `${role.name} was created.`, "success");
+    await sendTypedLog(role.guild, "moderation", "Role Created", `${role.name} was created.`, "success");
     const executorId = await fetchExecutor(role.guild, AuditLogEvent.RoleCreate, role.id);
     if (executorId) await antiNukeCheck(role.guild, executorId, "roleCreate", { target: role.name });
   }
@@ -1111,7 +1240,7 @@ client.on(Events.RoleCreate, async role => {
 
 client.on(Events.RoleUpdate, async (oldRole, newRole) => {
   if (oldRole.name !== newRole.name) {
-    await sendLog(newRole.guild, "Role Updated", `${oldRole.name} renamed to ${newRole.name}.`, "info");
+    await sendTypedLog(newRole.guild, "moderation", "Role Updated", `${oldRole.name} renamed to ${newRole.name}.`, "info");
   }
 
   const before = new PermissionsBitField(oldRole.permissions.bitfield);
@@ -1126,7 +1255,7 @@ client.on(Events.RoleUpdate, async (oldRole, newRole) => {
 
 client.on(Events.WebhooksUpdate, async channel => {
   if (!channel.guild) return;
-  await sendLog(channel.guild, "Webhook Update", `Webhook update detected in ${channel.name}.`, "warn");
+  await sendTypedLog(channel.guild, "security", "Webhook Update", `Webhook update detected in ${channel.name}.`, "warn");
   const executorCreate = await fetchExecutor(channel.guild, AuditLogEvent.WebhookCreate, null, 20000);
   const executorDelete = await fetchExecutor(channel.guild, AuditLogEvent.WebhookDelete, null, 20000);
   const executorUpdate = await fetchExecutor(channel.guild, AuditLogEvent.WebhookUpdate, null, 20000);
@@ -1135,6 +1264,7 @@ client.on(Events.WebhooksUpdate, async channel => {
 });
 
 client.on(Events.GuildBanAdd, async ban => {
+  await sendTypedLog(ban.guild, "member", "Member Banned", `${ban.user.tag} was banned.`, "error");
   const executorId = await fetchExecutor(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id);
   if (executorId) await antiNukeCheck(ban.guild, executorId, "memberBan", { target: ban.user.tag });
 });
@@ -1151,6 +1281,19 @@ client.on(Events.GuildAuditLogEntryCreate, async entry => {
   if (entry.action === AuditLogEvent.GuildUpdate) action = "guildUpdate";
   if (entry.action === AuditLogEvent.BotAdd) action = "botAdd";
   if (!action) return;
+
+  if (action === "memberKick") {
+    await sendTypedLog(guild, "member", "Member Kicked", `Audit log reports a member kick by <@${executorId}>.`, "warn");
+  }
+  if (action === "memberTimeout") {
+    await sendTypedLog(guild, "member", "Member Timed Out", `Audit log reports a timeout by <@${executorId}>.`, "warn");
+  }
+  if (action === "guildUpdate") {
+    await sendTypedLog(guild, "security", "Guild Updated", `Rapid guild setting update detected by <@${executorId}>.`, "warn");
+  }
+  if (action === "botAdd") {
+    await sendTypedLog(guild, "security", "Bot Added", `A bot was added by <@${executorId}>.`, "warn");
+  }
 
   await antiNukeCheck(guild, executorId, action, {
     target: entry.target?.tag || entry.target?.name || entry.targetId || "unknown"
@@ -1269,7 +1412,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await target.timeout(durationMs, reason);
         await interaction.reply({ embeds: [makeEmbed("Timed Out", `${user.tag} has been timed out.`, "warn")] });
 
-        await sendLog(interaction.guild, "Member Timed Out", `${interaction.user.tag} timed out ${user.tag}.`, "warn", [
+        await sendTypedLog(interaction.guild, "member", "Member Timed Out", `${interaction.user.tag} timed out ${user.tag}.`, "warn", [
           { name: "Duration", value: duration, inline: true },
           { name: "Reason", value: reason, inline: true }
         ]);
@@ -1294,7 +1437,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await target.timeout(null, reason);
         await interaction.reply({ embeds: [makeEmbed("Timeout Removed", `${user.tag}'s timeout was removed.`, "success")] });
 
-        await sendLog(interaction.guild, "Timeout Removed", `${interaction.user.tag} removed ${user.tag}'s timeout.`, "success", [
+        await sendTypedLog(interaction.guild, "member", "Timeout Removed", `${interaction.user.tag} removed ${user.tag}'s timeout.`, "success", [
           { name: "Reason", value: reason }
         ]);
         return;
@@ -1307,7 +1450,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.guild.members.ban(user.id, { reason });
 
         await interaction.reply({ embeds: [makeEmbed("Member Banned", `${user.tag} has been banned.`, "error")] });
-        await sendLog(interaction.guild, "Member Banned", `${interaction.user.tag} banned ${user.tag}.`, "error", [
+        await sendTypedLog(interaction.guild, "member", "Member Banned", `${interaction.user.tag} banned ${user.tag}.`, "error", [
           { name: "Reason", value: reason }
         ]);
         return;
@@ -1326,7 +1469,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await target.kick(reason);
 
         await interaction.reply({ embeds: [makeEmbed("Member Kicked", `${user.tag} has been kicked.`, "warn")] });
-        await sendLog(interaction.guild, "Member Kicked", `${interaction.user.tag} kicked ${user.tag}.`, "warn", [
+        await sendTypedLog(interaction.guild, "member", "Member Kicked", `${interaction.user.tag} kicked ${user.tag}.`, "warn", [
           { name: "Reason", value: reason }
         ]);
         return;
@@ -1343,7 +1486,7 @@ client.on(Events.InteractionCreate, async interaction => {
         const deleted = await interaction.channel.bulkDelete(amount, true);
 
         await interaction.reply({ embeds: [makeEmbed("Messages Deleted", `Deleted ${deleted.size} messages.`, "success")], ephemeral: true });
-        await sendLog(interaction.guild, "Messages Purged", `${interaction.user.tag} purged messages in ${interaction.channel}.`, "warn", [
+        await sendTypedLog(interaction.guild, "moderation", "Messages Purged", `${interaction.user.tag} purged messages in ${interaction.channel}.`, "warn", [
           { name: "Deleted", value: String(deleted.size) }
         ]);
         return;
@@ -1353,7 +1496,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false });
 
         await interaction.reply({ embeds: [makeEmbed("Channel Locked", `${interaction.channel} has been locked.`, "warn")] });
-        await sendLog(interaction.guild, "Channel Locked", `${interaction.user.tag} locked ${interaction.channel}.`, "warn");
+        await sendTypedLog(interaction.guild, "moderation", "Channel Locked", `${interaction.user.tag} locked ${interaction.channel}.`, "warn");
         return;
       }
 
@@ -1361,7 +1504,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: true });
 
         await interaction.reply({ embeds: [makeEmbed("Channel Unlocked", `${interaction.channel} has been unlocked.`, "success")] });
-        await sendLog(interaction.guild, "Channel Unlocked", `${interaction.user.tag} unlocked ${interaction.channel}.`, "success");
+        await sendTypedLog(interaction.guild, "moderation", "Channel Unlocked", `${interaction.user.tag} unlocked ${interaction.channel}.`, "success");
         return;
       }
 
@@ -1397,7 +1540,7 @@ client.on(Events.InteractionCreate, async interaction => {
           ])]
         });
 
-        await sendLog(interaction.guild, "Member Warned", `${interaction.user.tag} warned ${user.tag}.`, "warn", [
+        await sendTypedLog(interaction.guild, "moderation", "Member Warned", `${interaction.user.tag} warned ${user.tag}.`, "warn", [
           { name: "Reason", value: reason },
           { name: "Total Warnings", value: String(count) }
         ]);
@@ -1427,6 +1570,85 @@ client.on(Events.InteractionCreate, async interaction => {
 
         await interaction.reply({
           embeds: [makeEmbed("Invite Count", `**${user.tag}** has **${count}** tracked invite${count === 1 ? "" : "s"}.`, "info")]
+        });
+        return;
+      }
+
+      if (cmd === "backup") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+
+        const action = String(interaction.options.getString("action") || "").trim().toLowerCase();
+        const backups = loadBackups();
+
+        if (action === "create") {
+          const snapshot = createGuildBackupSnapshot(interaction.guild, interaction.user.id);
+          backups.unshift(snapshot);
+          const maxStored = Math.max(1, config.backup?.maxStored || 20);
+          const scopedCount = backups.filter(b => b.guildId === interaction.guild.id).length;
+          if (scopedCount > maxStored) {
+            let remaining = maxStored;
+            const kept = [];
+            for (const item of backups) {
+              if (item.guildId === interaction.guild.id) {
+                if (remaining > 0) {
+                  kept.push(item);
+                  remaining -= 1;
+                }
+                continue;
+              }
+              kept.push(item);
+            }
+            saveBackups(kept);
+          } else {
+            saveBackups(backups);
+          }
+
+          await interaction.reply({
+            embeds: [makeEmbed("Backup Created", `Backup \`${snapshot.id}\` created.\nRoles: **${snapshot.stats.roleCount}**\nChannels: **${snapshot.stats.channelCount}**`, "success")],
+            ephemeral: true
+          });
+          await sendTypedLog(interaction.guild, "security", "Backup Created", `${interaction.user.tag} created backup ${snapshot.id}.`, "info");
+          return;
+        }
+
+        if (action === "list") {
+          await interaction.reply({
+            embeds: [makeEmbed("Available Backups", formatBackupList(backups, interaction.guild.id), "info")],
+            ephemeral: true
+          });
+          return;
+        }
+
+        if (action === "restore") {
+          const backupId = interaction.options.getString("backup_id");
+          const confirm = interaction.options.getBoolean("confirm") === true;
+          if (!backupId) {
+            await interaction.reply({ embeds: [makeEmbed("Missing Backup ID", "Provide `backup_id` when using restore.", "error")], ephemeral: true });
+            return;
+          }
+
+          const snapshot = backups.find(b => b.id === backupId && b.guildId === interaction.guild.id);
+          if (!snapshot) {
+            await interaction.reply({ embeds: [makeEmbed("Backup Not Found", "No backup with that ID exists for this server.", "error")], ephemeral: true });
+            return;
+          }
+
+          const result = await restoreGuildBackupSnapshot(interaction.guild, snapshot, { dryRun: !confirm });
+          const modeText = result.dryRun ? "Dry Run (no changes applied)" : "Restore Applied";
+          await interaction.reply({
+            embeds: [makeEmbed("Backup Restore Result", `Mode: **${modeText}**\nRoles to create: **${result.rolesCreated}**\nChannels to create: **${result.channelsCreated}**\nExisting roles skipped: **${result.rolesSkippedExisting}**\nExisting channels skipped: **${result.channelsSkippedExisting}**\nUnsupported skipped: **${result.unsupportedChannelsSkipped}**\n\nSet \`confirm=true\` to apply restore.`, result.dryRun ? "warn" : "success")],
+            ephemeral: true
+          });
+          await sendTypedLog(interaction.guild, "security", "Backup Restore", `${interaction.user.tag} ran ${result.dryRun ? "dry-run" : "applied"} restore for ${snapshot.id}.`, result.dryRun ? "warn" : "error");
+          return;
+        }
+
+        await interaction.reply({
+          embeds: [makeEmbed("Invalid Action", "Use action `create`, `list`, or `restore`.", "error")],
+          ephemeral: true
         });
         return;
       }

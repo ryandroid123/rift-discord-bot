@@ -70,6 +70,15 @@ module.exports = [
     options: [{ name: "user", type: 6, required: false, description: "User" }]
   },
   {
+    name: "backup",
+    description: "Create, list, or restore a server backup.",
+    options: [
+      { name: "action", type: 3, required: true, description: "create/list/restore" },
+      { name: "backup_id", type: 3, required: false, description: "Backup ID for restore" },
+      { name: "confirm", type: 5, required: false, description: "Set true to apply restore" }
+    ]
+  },
+  {
     name: "giveaway",
     description: "Create a giveaway in the current channel.",
     options: [

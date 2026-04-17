@@ -11,7 +11,11 @@ module.exports = {
   channels: {
     support: "support",
     applications: "staff-application",
-    logs: "bot-logs",
+    logs: "🤖┃bot-logs",
+    securityLogs: "🤖┃bot-logs",
+    moderationLogs: "🤖┃bot-logs",
+    messageLogs: "🤖┃bot-logs",
+    memberLogs: "🤖┃bot-logs",
     transcripts: "ticket-transcripts",
     giveaways: "🎂┃giveaways",
     streams: "📡┃stream-alerts",
@@ -94,7 +98,8 @@ module.exports = {
       joinLimit: 8,
       action: "log",
       slowmodeSeconds: 10
-    }
+    },
+    minMessageLengthForAggressiveChecks: 6
   },
 
   antinuke: {
@@ -127,6 +132,10 @@ module.exports = {
 
   social: {
     checkIntervalMs: 120000
+  },
+
+  backup: {
+    maxStored: 20
   },
 
   riddle: {

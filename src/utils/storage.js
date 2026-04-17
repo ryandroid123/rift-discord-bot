@@ -7,6 +7,7 @@ function ensureDir(filePath) {
 }
 
 let cachedDataDirInfo = null;
+const migratedFiles = new Set();
 
 function resolveDataDirInfo() {
   if (cachedDataDirInfo) return cachedDataDirInfo;
@@ -55,19 +56,31 @@ function coerceFilePath(filePath) {
   return resolveDataPath(filePath);
 }
 
+function maybeMigrateFromLegacy(filePath) {
+  const info = resolveDataDirInfo();
+  if (info.source !== "DATA_DIR") return false;
+  if (fs.existsSync(filePath)) return false;
+
+  const legacyPath = path.resolve(__dirname, "../data", path.basename(filePath));
+  if (legacyPath === filePath || !fs.existsSync(legacyPath)) return false;
+
+  ensureDir(filePath);
+  fs.copyFileSync(legacyPath, filePath);
+
+  if (!migratedFiles.has(filePath)) {
+    console.log(`[storage] migrated ${path.basename(filePath)} from ${legacyPath} -> ${filePath}`);
+    migratedFiles.add(filePath);
+  }
+
+  return true;
+}
+
 function ensureDataFile(fileName, defaultValue) {
   const filePath = resolveDataPath(fileName);
   ensureDir(filePath);
+  maybeMigrateFromLegacy(filePath);
 
   if (!fs.existsSync(filePath)) {
-    const legacyPath = path.resolve(__dirname, "../data", fileName);
-    if (legacyPath !== filePath && fs.existsSync(legacyPath)) {
-      const legacyContent = fs.readFileSync(legacyPath, "utf8");
-      if (legacyContent.trim()) {
-        fs.writeFileSync(filePath, legacyContent, "utf8");
-        return filePath;
-      }
-    }
     fs.writeFileSync(filePath, JSON.stringify(defaultValue, null, 2), "utf8");
   }
 
@@ -78,6 +91,7 @@ function readJson(filePath, defaultValue) {
   try {
     const targetPath = coerceFilePath(filePath);
     ensureDir(targetPath);
+    maybeMigrateFromLegacy(targetPath);
     if (!fs.existsSync(targetPath)) {
       fs.writeFileSync(targetPath, JSON.stringify(defaultValue, null, 2), "utf8");
       return defaultValue;

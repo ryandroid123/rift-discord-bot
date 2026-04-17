@@ -99,7 +99,23 @@ module.exports = {
       action: "log",
       slowmodeSeconds: 10
     },
-    minMessageLengthForAggressiveChecks: 6
+    minMessageLengthForAggressiveChecks: 6,
+    context: {
+      safeChannels: [],
+      strictChannels: []
+    },
+    adaptive: {
+      enabled: true,
+      maxRiskTightening: 3
+    },
+    escalationLadder: [
+      { minSeverity: 1, action: "warn" },
+      { minSeverity: 3, action: "delete" },
+      { minSeverity: 5, action: "timeout", durationMs: 10 * 60 * 1000 },
+      { minSeverity: 7, action: "timeout", durationMs: 60 * 60 * 1000 },
+      { minSeverity: 9, action: "kick", requireFlag: "allowKick" },
+      { minSeverity: 10, action: "ban", requireFlag: "allowBan" }
+    ]
   },
 
   antinuke: {
@@ -127,7 +143,9 @@ module.exports = {
       timeoutOffender: true,
       kickOffender: false,
       banOffender: false
-    }
+    },
+    protectedRoles: ["Founder", "Admin"],
+    realtimeMonitorIntervalMs: 45000
   },
 
   social: {
@@ -135,7 +153,9 @@ module.exports = {
   },
 
   backup: {
-    maxStored: 20
+    maxStored: 20,
+    schedulerEnabled: true,
+    schedulerIntervalMs: 6 * 60 * 60 * 1000
   },
 
   riddle: {

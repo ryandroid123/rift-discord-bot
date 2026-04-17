@@ -47,6 +47,7 @@ const {
 } = require("./utils/setup");
 const { checkStreams, loadStreams, saveStreams, checkTwitch, checkYouTube, checkKick, checkTikTok } = require("./utils/socials");
 const { createGuildBackupSnapshot, restoreGuildBackupSnapshot } = require("./utils/backup");
+const governance = require("./utils/governance");
 
 const client = new Client({
   intents: [
@@ -91,13 +92,16 @@ const joinRaidCache = new Map();
 const logQueueByChannel = new Map();
 const streamCheckState = { running: false };
 const antiNukeDedupe = new Map();
+const coordinatedSpamCache = new Map();
 
 function logChannel(guild) {
-  return getChannelByName(guild, config.channels.logs);
+  const cfg = governance.mergeWithRuntime(config);
+  return getChannelByName(guild, cfg.channels.logs);
 }
 
 function getLogChannelByType(guild, kind = "general") {
-  const channels = config.channels || {};
+  const cfg = governance.mergeWithRuntime(config);
+  const channels = cfg.channels || {};
   const map = {
     general: channels.logs,
     moderation: channels.moderationLogs || channels.logs,
@@ -109,7 +113,8 @@ function getLogChannelByType(guild, kind = "general") {
 }
 
 function transcriptChannel(guild) {
-  return getChannelByName(guild, config.channels.transcripts);
+  const cfg = governance.mergeWithRuntime(config);
+  return getChannelByName(guild, cfg.channels.transcripts);
 }
 
 function state() {
@@ -160,6 +165,146 @@ function saveBackups(data) {
   writeJson(backupsPath, data);
 }
 
+function parseConfigValue(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  if (text === "true") return true;
+  if (text === "false") return false;
+  if (/^-?\d+(\.\d+)?$/.test(text)) return Number(text);
+  if ((text.startsWith("{") && text.endsWith("}")) || (text.startsWith("[") && text.endsWith("]"))) {
+    try {
+      return JSON.parse(text);
+    } catch {}
+  }
+  return text;
+}
+
+function currentConfig() {
+  return governance.mergeWithRuntime(config);
+}
+
+function addCaseAndTimeline(guildId, type, moderatorId, targetId, reason, durationMs = null, meta = {}) {
+  const c = governance.addCase({
+    guildId,
+    type,
+    moderatorId,
+    targetId,
+    reason,
+    durationMs,
+    meta
+  });
+  governance.appendTimeline({
+    guildId,
+    type,
+    actorId: moderatorId,
+    targetId,
+    reason,
+    caseId: c.caseId,
+    details: meta
+  });
+  return c;
+}
+
+function formatCaseLine(c) {
+  return `\`${c.caseId}\` • ${c.type} • <t:${Math.floor(c.timestamp / 1000)}:R> • ${c.reason}`;
+}
+
+function getUserHistorySummary(guildId, userId) {
+  const warnings = getWarnings(guildId, userId);
+  const cases = governance.getCasesForUser(guildId, userId, 30);
+  const timeline = governance.getTimeline(guildId, { userId, limit: 30 });
+  const automodHits = timeline.filter(x => x.type === "automod").length;
+  const antiNukeHits = timeline.filter(x => String(x.type || "").includes("antinuke")).length;
+  return {
+    warnings,
+    cases,
+    timeline,
+    automodHits,
+    antiNukeHits
+  };
+}
+
+function adjustRiskForRule(guildId, userId, rule, baseDelta = 0) {
+  const weights = {
+    "phishing-heuristic": 9,
+    "suspicious-link-pattern": 8,
+    "invite-link": 5,
+    "rapid-spam": 4,
+    "repeat-spam": 4,
+    "duplicate-message": 4,
+    "repeated-link-spam": 6,
+    "repeated-attachment-spam": 6,
+    "unicode-obfuscation": 5,
+    "zalgo-obfuscation": 4
+  };
+  const delta = (weights[rule] || 3) + baseDelta;
+  return governance.adjustRisk(guildId, userId, delta, `rule:${rule}`);
+}
+
+function getThreatAdjustedValue(base, risk, maxTightening = 3, minValue = 1) {
+  const tighten = Math.min(maxTightening, Math.floor(risk / 20));
+  return Math.max(minValue, base - tighten);
+}
+
+function isLinkContent(text) {
+  return /https?:\/\/|discord(?:app)?\.com\/invite\/|discord\.gg\//i.test(text || "");
+}
+
+async function runAdvancedPurge(channel, options) {
+  const scanLimit = Math.min(500, Math.max(1, options.limit || 100));
+  const minutes = options.minutes || null;
+  const keyword = String(options.keyword || "").toLowerCase();
+  const mode = options.mode;
+  const userId = options.userId || null;
+  const cutoffTs = minutes ? Date.now() - (minutes * 60 * 1000) : null;
+
+  const batchCount = Math.ceil(scanLimit / 100);
+  let before = null;
+  const all = [];
+
+  for (let i = 0; i < batchCount; i += 1) {
+    const fetched = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
+    if (!fetched?.size) break;
+    const arr = [...fetched.values()];
+    all.push(...arr);
+    before = arr[arr.length - 1]?.id || null;
+    if (!before) break;
+    if (all.length >= scanLimit) break;
+  }
+
+  const scanned = all.slice(0, scanLimit);
+  const filtered = scanned.filter(m => {
+    if (cutoffTs && m.createdTimestamp < cutoffTs) return false;
+    if (mode === "all") return true;
+    if (mode === "user") return userId ? m.author.id === userId : false;
+    if (mode === "keyword") return keyword ? String(m.content || "").toLowerCase().includes(keyword) : false;
+    if (mode === "links") return isLinkContent(m.content);
+    if (mode === "attachments") return (m.attachments?.size || 0) > 0;
+    return false;
+  });
+
+  let deleted = 0;
+  const now = Date.now();
+  const bulk = filtered.filter(m => now - m.createdTimestamp < 14 * 24 * 60 * 60 * 1000);
+  const old = filtered.filter(m => now - m.createdTimestamp >= 14 * 24 * 60 * 60 * 1000);
+
+  if (bulk.length) {
+    const chunks = [];
+    for (let i = 0; i < bulk.length; i += 100) chunks.push(bulk.slice(i, i + 100));
+    for (const chunk of chunks) {
+      const result = await channel.bulkDelete(chunk.map(m => m.id), true).catch(() => null);
+      deleted += result?.size || 0;
+    }
+  }
+
+  for (const msg of old) {
+    const ok = await msg.delete().then(() => true).catch(() => false);
+    if (ok) deleted += 1;
+  }
+
+  return { scanned: scanned.length, matched: filtered.length, deleted };
+}
+
 function formatBackupList(backups, guildId) {
   const scoped = backups.filter(b => b.guildId === guildId).slice(0, 10);
   if (!scoped.length) return "No backups found for this server.";
@@ -191,7 +336,7 @@ function appendModerationLog(entry) {
 }
 
 function getAutoModSettings() {
-  const automod = config.automod || {};
+  const automod = currentConfig().automod || {};
   return {
     enabled: automod.enabled !== false,
     whitelistRoles: automod.whitelistRoles || [],
@@ -226,12 +371,15 @@ function getAutoModSettings() {
     allowKick: automod.allowKick === true,
     allowBan: automod.allowBan === true,
     antiInvite: automod.antiInvite !== false,
-    antiPhishing: automod.antiPhishing !== false
+    antiPhishing: automod.antiPhishing !== false,
+    adaptive: automod.adaptive || { enabled: false, maxRiskTightening: 0 },
+    context: automod.context || { safeChannels: [], strictChannels: [] },
+    escalationLadder: automod.escalationLadder || []
   };
 }
 
 function getAntiNukeSettings() {
-  const antinuke = config.antinuke || {};
+  const antinuke = currentConfig().antinuke || {};
   return {
     threshold: antinuke.threshold ?? 3,
     windowMs: antinuke.windowMs ?? 30000,
@@ -321,7 +469,7 @@ function storeAutoModHistory(key, history, item) {
 function detectAutoModTrigger(message, settings, options = {}) {
   const shouldRecordHistory = options.recordHistory !== false;
   const content = message.content || "";
-  const minAggressiveLen = config.automod?.minMessageLengthForAggressiveChecks ?? 6;
+  const minAggressiveLen = currentConfig().automod?.minMessageLengthForAggressiveChecks ?? 6;
   const aggressiveEligible = content.length >= minAggressiveLen;
   const lower = content.toLowerCase();
   const links = getMessageLinks(content);
@@ -335,6 +483,45 @@ function detectAutoModTrigger(message, settings, options = {}) {
   const caps = letters.replace(/[^A-Z]/g, "").length;
   const bypassCaps = hasAnyRole(message.member, settings.capsBypassRoles || []);
   const { key, history, now } = getAutoModHistory(message, settings);
+  const risk = governance.getRisk(message.guild.id, message.author.id);
+
+  const strictChannel = (settings.context?.strictChannels || []).includes(message.channel.id);
+  const safeChannel = (settings.context?.safeChannels || []).includes(message.channel.id);
+
+  let maxMentions = settings.maxMentions;
+  let spamLimit = settings.spamLimit;
+  let repeatLimit = settings.repeatLimit;
+  let duplicateLimit = settings.duplicateLimit;
+  let maxEmoji = settings.maxEmoji;
+  let maxLineBreaks = settings.maxLineBreaks;
+  let capsThreshold = settings.capsThreshold;
+
+  if (settings.adaptive?.enabled) {
+    const tightenMax = settings.adaptive.maxRiskTightening ?? 3;
+    spamLimit = getThreatAdjustedValue(spamLimit, risk, tightenMax);
+    repeatLimit = getThreatAdjustedValue(repeatLimit, risk, tightenMax);
+    duplicateLimit = getThreatAdjustedValue(duplicateLimit, risk, tightenMax);
+    maxMentions = getThreatAdjustedValue(maxMentions, risk, tightenMax);
+    maxEmoji = getThreatAdjustedValue(maxEmoji, risk, tightenMax);
+    maxLineBreaks = getThreatAdjustedValue(maxLineBreaks, risk, tightenMax);
+    capsThreshold = Math.max(0.55, capsThreshold - Math.min(0.12, Math.floor(risk / 20) * 0.03));
+  }
+
+  if (strictChannel) {
+    spamLimit = Math.max(2, spamLimit - 1);
+    repeatLimit = Math.max(2, repeatLimit - 1);
+    duplicateLimit = Math.max(2, duplicateLimit - 1);
+    maxMentions = Math.max(2, maxMentions - 1);
+    maxEmoji = Math.max(4, maxEmoji - 2);
+  }
+
+  if (safeChannel) {
+    spamLimit += 1;
+    repeatLimit += 1;
+    duplicateLimit += 1;
+    maxMentions += 1;
+    maxEmoji += 2;
+  }
 
   if (shouldRecordHistory) {
     const historyItem = {
@@ -374,19 +561,19 @@ function detectAutoModTrigger(message, settings, options = {}) {
     }
   }
 
-  if (mentions >= settings.maxMentions) {
+  if (mentions >= maxMentions) {
     return { rule: "mention-spam", reason: "Too many mentions", evidence: `${mentions} mentions` };
   }
 
-  if (!bypassCaps && letters.length >= settings.capsMinLetters && caps / letters.length >= settings.capsThreshold) {
+  if (!bypassCaps && letters.length >= settings.capsMinLetters && caps / letters.length >= capsThreshold) {
     return { rule: "mass-caps", reason: "Excessive capitalization", evidence: `${caps}/${letters.length} capital letters` };
   }
 
-  if (emojiCount >= settings.maxEmoji) {
+  if (emojiCount >= maxEmoji) {
     return { rule: "emoji-spam", reason: "Too many emojis", evidence: `${emojiCount} emojis` };
   }
 
-  if (lineBreaks >= settings.maxLineBreaks) {
+  if (lineBreaks >= maxLineBreaks) {
     return { rule: "line-break-flood", reason: "Too many line breaks", evidence: `${lineBreaks} line breaks` };
   }
 
@@ -407,20 +594,40 @@ function detectAutoModTrigger(message, settings, options = {}) {
   }
 
   const recentSpam = history.filter(x => now - x.time <= settings.spamWindowMs);
-  if (recentSpam.length >= settings.spamLimit) {
+  if (recentSpam.length >= spamLimit) {
     return { rule: "rapid-spam", reason: "Messages sent too quickly", evidence: `${recentSpam.length} messages in ${settings.spamWindowMs}ms` };
   }
 
   const recentRepeat = history.filter(x => now - x.time <= settings.repeatWindowMs);
   const repeatedExact = recentRepeat.filter(x => x.text && x.text === content).length;
-  if (content && repeatedExact >= settings.repeatLimit) {
+  if (content && repeatedExact >= repeatLimit) {
     return { rule: "repeat-spam", reason: "Repeated identical messages", evidence: `${repeatedExact} repeated messages` };
   }
 
   const recentDuplicate = history.filter(x => now - x.time <= settings.duplicateWindowMs);
   const repeatedNormalized = recentDuplicate.filter(x => x.normalized && x.normalized === normalized).length;
-  if (normalized && repeatedNormalized >= settings.duplicateLimit) {
+  if (normalized && repeatedNormalized >= duplicateLimit) {
     return { rule: "duplicate-message", reason: "Duplicate/near-duplicate spam", evidence: `${repeatedNormalized} duplicate messages` };
+  }
+
+  const slowSpamRecent = history.filter(x => now - x.time <= 60 * 1000);
+  const slowSpamCount = slowSpamRecent.filter(x => x.normalized === normalized).length;
+  if (normalized && slowSpamCount >= 6) {
+    return { rule: "slow-spam", reason: "Repeated content over extended period", evidence: `${slowSpamCount} repeated messages in 60s` };
+  }
+
+  if (normalized) {
+    const cKey = `${message.guild.id}:${message.channel.id}:${normalized.slice(0, 80)}`;
+    const cItem = coordinatedSpamCache.get(cKey) || { users: new Map(), last: 0 };
+    cItem.users.set(message.author.id, now);
+    cItem.last = now;
+    coordinatedSpamCache.set(cKey, cItem);
+    for (const [u, t] of cItem.users.entries()) {
+      if (now - t > 30000) cItem.users.delete(u);
+    }
+    if (cItem.users.size >= 4) {
+      return { rule: "coordinated-spam", reason: "Multiple users posting the same pattern", evidence: `${cItem.users.size} users in 30s` };
+    }
   }
 
   if (links.length) {
@@ -450,26 +657,67 @@ async function applyAutoModAction(message, trigger) {
   await message.delete().catch(() => {});
   const warningReason = `AutoMod (${trigger.rule}): ${trigger.reason}`;
   const offences = addWarning(message.guild.id, message.author.id, "AutoMod", warningReason);
+  governance.incrementAnalytics(message.guild.id, "automodTriggers", 1);
+  const riskScore = adjustRiskForRule(message.guild.id, message.author.id, trigger.rule);
+  const severityBase = Math.min(10, Math.max(1, Math.floor(offences / 2) + Math.floor(riskScore / 15)));
+
+  const severityWeights = {
+    "phishing-heuristic": 4,
+    "suspicious-link-pattern": 3,
+    "coordinated-spam": 3,
+    "slow-spam": 2,
+    "repeated-link-spam": 2
+  };
+  const severity = Math.min(10, severityBase + (severityWeights[trigger.rule] || 0));
 
   let action = "warn";
   let actionDetail = "Warned user and removed message";
+  let durationMs = null;
 
-  if (offences >= settings.banThreshold && settings.allowBan) {
+  const ladder = [...(settings.escalationLadder || [])]
+    .sort((a, b) => (a.minSeverity || 0) - (b.minSeverity || 0));
+  let selected = null;
+  for (const step of ladder) {
+    if (severity >= (step.minSeverity || 0)) selected = step;
+  }
+
+  if (!selected) {
+    if (offences >= settings.banThreshold && settings.allowBan) {
+      selected = { action: "ban" };
+    } else if (offences >= settings.kickThreshold && settings.allowKick) {
+      selected = { action: "kick" };
+    } else if (offences >= settings.severeTimeoutThreshold) {
+      selected = { action: "timeout", durationMs: settings.severeTimeoutMs };
+    } else if (offences >= settings.timeoutThreshold) {
+      selected = { action: "timeout", durationMs: settings.timeoutMs };
+    } else {
+      selected = { action: "warn" };
+    }
+  }
+
+  if (selected.requireFlag && settings[selected.requireFlag] !== true) {
+    selected = { action: "timeout", durationMs: settings.timeoutMs };
+  }
+
+  if (selected.action === "ban") {
     action = "ban";
     actionDetail = "Banned user for repeated AutoMod violations";
     await message.guild.members.ban(message.author.id, { reason: `AutoMod: ${trigger.rule}` }).catch(() => {});
-  } else if (offences >= settings.kickThreshold && settings.allowKick) {
+    governance.incrementAnalytics(message.guild.id, "automodBans", 1);
+  } else if (selected.action === "kick") {
     action = "kick";
     actionDetail = "Kicked user for repeated AutoMod violations";
     await member.kick(`AutoMod: ${trigger.rule}`).catch(() => {});
-  } else if (offences >= settings.severeTimeoutThreshold && member.moderatable) {
+    governance.incrementAnalytics(message.guild.id, "automodKicks", 1);
+  } else if (selected.action === "timeout" && member.moderatable) {
+    durationMs = selected.durationMs || settings.timeoutMs;
     action = "timeout";
-    actionDetail = `Timed out for ${Math.floor(settings.severeTimeoutMs / 60000)} minutes`;
-    await member.timeout(settings.severeTimeoutMs, `AutoMod: ${trigger.rule}`).catch(() => {});
-  } else if (offences >= settings.timeoutThreshold && member.moderatable) {
-    action = "timeout";
-    actionDetail = `Timed out for ${Math.floor(settings.timeoutMs / 60000)} minutes`;
-    await member.timeout(settings.timeoutMs, `AutoMod: ${trigger.rule}`).catch(() => {});
+    actionDetail = `Timed out for ${Math.floor(durationMs / 60000)} minutes`;
+    await member.timeout(durationMs, `AutoMod: ${trigger.rule}`).catch(() => {});
+    governance.incrementAnalytics(message.guild.id, "automodTimeouts", 1);
+  } else if (selected.action === "delete") {
+    action = "delete";
+    actionDetail = "Deleted message";
   }
 
   await message.author.send({
@@ -479,10 +727,22 @@ async function applyAutoModAction(message, trigger) {
   await sendTypedLog(message.guild, "moderation", "AutoMod Action", `${message.author.tag} triggered ${trigger.rule}.`, "warn", [
     { name: "Rule", value: trigger.rule, inline: true },
     { name: "Action", value: action, inline: true },
+    { name: "Severity", value: String(severity), inline: true },
+    { name: "Risk", value: String(riskScore), inline: true },
     { name: "Warnings", value: String(offences), inline: true },
     { name: "Evidence", value: (trigger.evidence || "n/a").slice(0, 1000) },
     { name: "Message", value: (message.content || "[attachment-only]").slice(0, 1000) }
   ]);
+
+  const autoCase = addCaseAndTimeline(
+    message.guild.id,
+    "automod",
+    client.user?.id || "system",
+    message.author.id,
+    `${trigger.rule}: ${trigger.reason}`,
+    durationMs,
+    { action, evidence: trigger.evidence || null, severity, warnings: offences, risk: riskScore }
+  );
 
   appendModerationLog({
     type: "automod",
@@ -493,7 +753,16 @@ async function applyAutoModAction(message, trigger) {
     evidence: trigger.evidence || null,
     action,
     warnings: offences,
+    caseId: autoCase.caseId,
     time: Date.now()
+  });
+  governance.appendTimeline({
+    guildId: guild.id,
+    type: "antinuke-alert",
+    actorId: member.id,
+    targetId: null,
+    reason: action,
+    details: { counts, target: extra.target || null }
   });
 
   const state = loadAutomodState();
@@ -834,12 +1103,21 @@ async function antiNukeCheck(guild, executorId, action, extra = {}) {
       { name: "Reason", value: immunity.reason, inline: true },
       { name: "Target", value: extra.target || "n/a", inline: true }
     ]);
+    governance.appendTimeline({
+      guildId: guild.id,
+      type: "antinuke-ignored",
+      actorId: member.id,
+      targetId: extra.targetId || null,
+      reason: `${action} ignored due to immunity`,
+      details: { immunity: immunity.reason, target: extra.target || null }
+    });
     return;
   }
   if (isTrustedAntiNukeActor(guild, member, settings)) return;
   if (!hasStaffRole(member) && !member.permissions.has(PermissionFlagsBits.ManageGuild)) return;
 
   const counts = recordAntiNuke(guild.id, executorId, action, settings);
+  governance.incrementAnalytics(guild.id, "antiNukeAlerts", 1);
 
   await sendTypedLog(guild, "security", "Anti-Nuke Alert", `Suspicious action detected: ${action}`, "warn", [
     { name: "User", value: member.user.tag, inline: true },
@@ -893,6 +1171,16 @@ async function antiNukeCheck(guild, executorId, action, extra = {}) {
     emergency: settings.emergency,
     time: Date.now()
   });
+  governance.incrementAnalytics(guild.id, "antiNukeActions", 1);
+  addCaseAndTimeline(
+    guild.id,
+    "antinuke",
+    client.user?.id || "system",
+    member.id,
+    `Anti-nuke response for ${action}`,
+    settings.emergency?.timeoutOffender ? settings.punishmentTimeoutMs : null,
+    { action, counts, target: extra.target || null }
+  );
 }
 
 async function cacheInvitesForGuild(guild) {
@@ -902,7 +1190,7 @@ async function cacheInvitesForGuild(guild) {
 }
 
 async function checkJoinRaid(member) {
-  const antiRaid = config.automod?.antiRaid || {};
+  const antiRaid = currentConfig().automod?.antiRaid || {};
   const enabled = antiRaid.enabled !== false;
   if (!enabled) return;
   const immunity = getProtectionImmunity(member, member.guild);
@@ -923,6 +1211,7 @@ async function checkJoinRaid(member) {
   joinRaidCache.set(key, timestamps);
 
   if (timestamps.length < joinLimit) return;
+  governance.incrementAnalytics(member.guild.id, "raidAttempts", 1);
 
   await sendTypedLog(member.guild, "security", "Anti-Raid Alert", `Join spike detected: ${timestamps.length} joins in ${Math.floor(windowMs / 1000)}s.`, "warn");
   appendModerationLog({
@@ -944,6 +1233,15 @@ async function checkJoinRaid(member) {
       await sendTypedLog(member.guild, "security", "Anti-Raid Action", `Applied ${seconds}s slowmode to ${chat}.`, "warn");
     }
   }
+
+  governance.appendTimeline({
+    guildId: member.guild.id,
+    type: "anti-raid",
+    actorId: client.user?.id || "system",
+    targetId: null,
+    reason: `Join spike ${timestamps.length} in ${windowMs}ms`,
+    details: { action }
+  });
 }
 
 async function runStreamChecksSafely() {
@@ -953,6 +1251,61 @@ async function runStreamChecksSafely() {
     await checkStreams(client, config, makeEmbed);
   } catch {}
   streamCheckState.running = false;
+}
+
+async function monitorGuildIntegrity(guild) {
+  const cfg = currentConfig();
+  const missing = [];
+  if (!getChannelByName(guild, cfg.channels.logs)) missing.push(cfg.channels.logs);
+  if (!getChannelByName(guild, cfg.channels.chat)) missing.push(cfg.channels.chat);
+  if (!getChannelByName(guild, cfg.channels.streams)) missing.push(cfg.channels.streams);
+
+  if (missing.length) {
+    await sendTypedLog(guild, "security", "Config/Channel Warning", `Missing configured channels: ${missing.join(", ")}`, "warn");
+  }
+}
+
+async function runMonitorLoop() {
+  for (const guild of client.guilds.cache.values()) {
+    await monitorGuildIntegrity(guild).catch(() => {});
+  }
+}
+
+function createScheduledBackupsIfNeeded() {
+  const cfg = currentConfig();
+  if (!cfg.backup?.schedulerEnabled) return;
+
+  const state = governance.getSchedulerState();
+  const intervalMs = Math.max(15 * 60 * 1000, cfg.backup.schedulerIntervalMs || 6 * 60 * 60 * 1000);
+  const now = Date.now();
+  if (state.nextBackupAt && now < state.nextBackupAt) return;
+
+  const all = loadBackups();
+  for (const guild of client.guilds.cache.values()) {
+    const snapshot = createGuildBackupSnapshot(guild, client.user?.id || "system");
+    all.unshift(snapshot);
+    governance.incrementAnalytics(guild.id, "scheduledBackups", 1);
+    governance.appendTimeline({
+      guildId: guild.id,
+      type: "backup-scheduled",
+      actorId: client.user?.id || "system",
+      targetId: null,
+      reason: `Scheduled backup ${snapshot.id}`,
+      details: { backupId: snapshot.id }
+    });
+  }
+
+  const maxStored = Math.max(1, cfg.backup.maxStored || 20);
+  const grouped = new Map();
+  const kept = [];
+  for (const item of all) {
+    const count = grouped.get(item.guildId) || 0;
+    if (count >= maxStored) continue;
+    grouped.set(item.guildId, count + 1);
+    kept.push(item);
+  }
+  saveBackups(kept);
+  governance.setSchedulerState({ nextBackupAt: now + intervalMs, lastBackupAt: now });
 }
 
 function shouldSkipAntiNukeDuplicate(guildId, executorId, action, target = "") {
@@ -1071,11 +1424,39 @@ client.once(Events.ClientReady, async () => {
   }, config.social?.checkIntervalMs || 2 * 60 * 1000);
   runStreamChecksSafely().catch(() => {});
 
+  const antinukeCfg = currentConfig().antinuke || {};
+  setInterval(() => {
+    runMonitorLoop().catch(() => {});
+  }, Math.max(15000, antinukeCfg.realtimeMonitorIntervalMs || 45000));
+  runMonitorLoop().catch(() => {});
+
+  setInterval(() => {
+    governance.decayRiskAll(1);
+  }, 5 * 60 * 1000);
+
+  setInterval(() => {
+    createScheduledBackupsIfNeeded();
+  }, 5 * 60 * 1000);
+  createScheduledBackupsIfNeeded();
+
   startRiddleLoop();
 });
 
 client.on(Events.GuildMemberAdd, async member => { 
   await checkJoinRaid(member).catch(() => {});
+  governance.incrementAnalytics(member.guild.id, "joins", 1);
+
+  const acctAgeMs = Date.now() - member.user.createdTimestamp;
+  const youngAccount = acctAgeMs < 3 * 24 * 60 * 60 * 1000;
+  const suspiciousName = /(free|nitro|gift|steam|admin|support|mod)/i.test(member.user.username);
+  if (youngAccount || suspiciousName) {
+    governance.incrementAnalytics(member.guild.id, "raidFingerprints", 1);
+    governance.adjustRisk(member.guild.id, member.id, 3, "join-fingerprint");
+    await sendTypedLog(member.guild, "security", "Raid Fingerprint", `${member.user.tag} matched suspicious join fingerprint.`, "warn", [
+      { name: "Account Age", value: `${Math.floor(acctAgeMs / (60 * 60 * 1000))}h`, inline: true },
+      { name: "Username Flag", value: suspiciousName ? "yes" : "no", inline: true }
+    ]);
+  }
 
   const role = getRoleByName(member.guild, config.autoRole);
   if (role) {
@@ -1188,6 +1569,7 @@ client.on(Events.MessageCreate, async message => {
   if (!message.guild || message.author.bot) return;
   if (Date.now() - message.createdTimestamp > 15000) return;
   if (!message.content && !message.attachments?.size) return;
+  governance.incrementAnalytics(message.guild.id, "messagesSeen", 1);
 
   const afk = loadAFK();
   if (afk[message.author.id]) {
@@ -1297,6 +1679,22 @@ client.on(Events.RoleUpdate, async (oldRole, newRole) => {
   const dangerous = getDangerousPermissionFlags();
   const escalated = dangerous.some(flag => !before.has(flag) && after.has(flag));
   if (!escalated) return;
+
+  const antinukeCfg = getAntiNukeSettings();
+  const protectedRoles = antinukeCfg.protectedRoles || [];
+  if (protectedRoles.some(name => name.toLowerCase() === newRole.name.toLowerCase())) {
+    await newRole.setPermissions(oldRole.permissions, "Permission guard auto-revert").catch(() => {});
+    await sendTypedLog(newRole.guild, "security", "Permission Guard Revert", `Dangerous permission escalation on protected role ${newRole.name} was reverted.`, "error");
+    governance.incrementAnalytics(newRole.guild.id, "permissionReverts", 1);
+    governance.appendTimeline({
+      guildId: newRole.guild.id,
+      type: "permission-revert",
+      actorId: client.user?.id || "system",
+      targetId: null,
+      reason: `Protected role ${newRole.name} permission escalation reverted`
+    });
+    return;
+  }
 
   const executorId = await fetchExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
   if (executorId) await antiNukeCheck(newRole.guild, executorId, "rolePermissionEscalation", { target: newRole.name });
@@ -1465,6 +1863,9 @@ client.on(Events.InteractionCreate, async interaction => {
           { name: "Duration", value: duration, inline: true },
           { name: "Reason", value: reason, inline: true }
         ]);
+        const c = addCaseAndTimeline(interaction.guild.id, "timeout", interaction.user.id, user.id, reason, durationMs, { duration });
+        governance.incrementAnalytics(interaction.guild.id, "manualTimeouts", 1);
+        await interaction.followUp({ embeds: [makeEmbed("Case Recorded", `Case ID: \`${c.caseId}\``, "info")], ephemeral: true }).catch(() => {});
         return;
       }
 
@@ -1489,6 +1890,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await sendTypedLog(interaction.guild, "member", "Timeout Removed", `${interaction.user.tag} removed ${user.tag}'s timeout.`, "success", [
           { name: "Reason", value: reason }
         ]);
+        addCaseAndTimeline(interaction.guild.id, "untimeout", interaction.user.id, user.id, reason, null, {});
         return;
       }
 
@@ -1502,6 +1904,9 @@ client.on(Events.InteractionCreate, async interaction => {
         await sendTypedLog(interaction.guild, "member", "Member Banned", `${interaction.user.tag} banned ${user.tag}.`, "error", [
           { name: "Reason", value: reason }
         ]);
+        const c = addCaseAndTimeline(interaction.guild.id, "ban", interaction.user.id, user.id, reason, null, {});
+        governance.incrementAnalytics(interaction.guild.id, "manualBans", 1);
+        await interaction.followUp({ embeds: [makeEmbed("Case Recorded", `Case ID: \`${c.caseId}\``, "info")], ephemeral: true }).catch(() => {});
         return;
       }
 
@@ -1521,6 +1926,9 @@ client.on(Events.InteractionCreate, async interaction => {
         await sendTypedLog(interaction.guild, "member", "Member Kicked", `${interaction.user.tag} kicked ${user.tag}.`, "warn", [
           { name: "Reason", value: reason }
         ]);
+        const c = addCaseAndTimeline(interaction.guild.id, "kick", interaction.user.id, user.id, reason, null, {});
+        governance.incrementAnalytics(interaction.guild.id, "manualKicks", 1);
+        await interaction.followUp({ embeds: [makeEmbed("Case Recorded", `Case ID: \`${c.caseId}\``, "info")], ephemeral: true }).catch(() => {});
         return;
       }
 
@@ -1593,6 +2001,8 @@ client.on(Events.InteractionCreate, async interaction => {
           { name: "Reason", value: reason },
           { name: "Total Warnings", value: String(count) }
         ]);
+        const c = addCaseAndTimeline(interaction.guild.id, "warn", interaction.user.id, user.id, reason, null, { warnings: count });
+        await interaction.followUp({ embeds: [makeEmbed("Case Recorded", `Case ID: \`${c.caseId}\``, "info")], ephemeral: true }).catch(() => {});
         return;
       }
 
@@ -1623,6 +2033,305 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
       }
 
+      if (cmd === "case") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const caseId = interaction.options.getString("caseid");
+        const c = governance.getCase(interaction.guild.id, caseId);
+        if (!c) {
+          await interaction.reply({ embeds: [makeEmbed("Not Found", "Case not found.", "error")], ephemeral: true });
+          return;
+        }
+        await interaction.reply({
+          embeds: [makeEmbed(`Case ${c.caseId}`, `Type: **${c.type}**\nModerator: <@${c.moderatorId}>\nTarget: ${c.targetId ? `<@${c.targetId}>` : "n/a"}\nReason: ${c.reason}\nWhen: <t:${Math.floor(c.timestamp / 1000)}:F>`, "info")]
+        });
+        return;
+      }
+
+      if (cmd === "cases") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const user = interaction.options.getUser("user");
+        const limit = Math.min(20, Math.max(1, interaction.options.getInteger("limit") || 10));
+        const items = governance.getCasesForUser(interaction.guild.id, user.id, limit);
+        const text = items.length ? items.map(formatCaseLine).join("\n") : "No cases found.";
+        await interaction.reply({ embeds: [makeEmbed(`Cases for ${user.tag}`, text.slice(0, 3900), "info")] });
+        return;
+      }
+
+      if (cmd === "history") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const user = interaction.options.getUser("user");
+        const h = getUserHistorySummary(interaction.guild.id, user.id);
+        const summary = [
+          `Warnings: **${h.warnings.length}**`,
+          `Cases: **${h.cases.length}**`,
+          `AutoMod Hits: **${h.automodHits}**`,
+          `Anti-Nuke Events: **${h.antiNukeHits}**`,
+          `Risk Score: **${governance.getRisk(interaction.guild.id, user.id)}**`
+        ].join("\n");
+        const latest = h.timeline.slice(0, 8).map(t => `• ${t.type} • <t:${Math.floor(t.timestamp / 1000)}:R>`).join("\n") || "No timeline entries.";
+        await interaction.reply({
+          embeds: [makeEmbed(`History for ${user.tag}`, `${summary}\n\n**Recent Timeline**\n${latest}`, "info")]
+        });
+        return;
+      }
+
+      if (cmd === "noteadd") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const user = interaction.options.getUser("user");
+        const text = interaction.options.getString("text");
+        const note = governance.addNote(interaction.guild.id, user.id, interaction.user.id, text);
+        governance.appendTimeline({
+          guildId: interaction.guild.id,
+          type: "staff-note-add",
+          actorId: interaction.user.id,
+          targetId: user.id,
+          reason: text,
+          details: { noteId: note.id }
+        });
+        await interaction.reply({ embeds: [makeEmbed("Note Added", `Note ID: \`${note.id}\``, "success")], ephemeral: true });
+        return;
+      }
+
+      if (cmd === "notes") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const user = interaction.options.getUser("user");
+        const notes = governance.getNotes(interaction.guild.id, user.id);
+        const text = notes.length
+          ? notes.slice(-20).reverse().map(n => `• \`${n.id}\` • <@${n.moderatorId}> • <t:${Math.floor(n.timestamp / 1000)}:R>\n${n.text}`).join("\n\n")
+          : "No notes.";
+        await interaction.reply({ embeds: [makeEmbed(`Notes for ${user.tag}`, text.slice(0, 3900), "info")], ephemeral: true });
+        return;
+      }
+
+      if (cmd === "noteremove") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const user = interaction.options.getUser("user");
+        const noteId = interaction.options.getString("noteid");
+        const ok = governance.removeNote(interaction.guild.id, user.id, noteId);
+        if (!ok) {
+          await interaction.reply({ embeds: [makeEmbed("Not Found", "Note not found.", "error")], ephemeral: true });
+          return;
+        }
+        governance.appendTimeline({
+          guildId: interaction.guild.id,
+          type: "staff-note-remove",
+          actorId: interaction.user.id,
+          targetId: user.id,
+          reason: `Removed note ${noteId}`
+        });
+        await interaction.reply({ embeds: [makeEmbed("Note Removed", `Removed \`${noteId}\`.`, "success")], ephemeral: true });
+        return;
+      }
+
+      if (cmd === "configview") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const group = interaction.options.getString("group");
+        const data = governance.getRuntimeConfigGroup(group);
+        await interaction.reply({
+          embeds: [makeEmbed(`Runtime Config: ${group}`, `\`\`\`json\n${JSON.stringify(data, null, 2).slice(0, 3600)}\n\`\`\``, "info")],
+          ephemeral: true
+        });
+        return;
+      }
+
+      if (cmd === "configset") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const group = interaction.options.getString("group");
+        const key = interaction.options.getString("key");
+        const valueRaw = interaction.options.getString("value");
+        const value = parseConfigValue(valueRaw);
+        governance.setRuntimeConfigValue(group, key, value);
+        governance.appendTimeline({
+          guildId: interaction.guild.id,
+          type: "config-set",
+          actorId: interaction.user.id,
+          targetId: null,
+          reason: `${group}.${key} updated`,
+          details: { value }
+        });
+        await interaction.reply({ embeds: [makeEmbed("Config Updated", `${group}.${key} set successfully.`, "success")], ephemeral: true });
+        return;
+      }
+
+      if (cmd === "stats") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const scope = String(interaction.options.getString("scope") || "overview").toLowerCase();
+        const a = governance.getAnalytics(interaction.guild.id);
+        const rows = Object.entries(a)
+          .filter(([k]) => !k.endsWith("At"))
+          .filter(([k]) => scope === "overview" ? true : k.toLowerCase().includes(scope))
+          .sort((a1, b1) => String(a1[0]).localeCompare(String(b1[0])));
+        const text = rows.length ? rows.map(([k, v]) => `• ${k}: **${v}**`).join("\n") : "No analytics yet.";
+        await interaction.reply({ embeds: [makeEmbed("Analytics", text.slice(0, 3900), "info")] });
+        return;
+      }
+
+      if (cmd === "risk") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const user = interaction.options.getUser("user");
+        const score = governance.getRisk(interaction.guild.id, user.id);
+        await interaction.reply({ embeds: [makeEmbed(`Risk: ${user.tag}`, `Current risk score: **${score}/100**`, score >= 70 ? "error" : score >= 40 ? "warn" : "success")] });
+        return;
+      }
+
+      if (cmd === "timeline") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const user = interaction.options.getUser("user");
+        const limit = Math.min(30, Math.max(1, interaction.options.getInteger("limit") || 15));
+        const items = governance.getTimeline(interaction.guild.id, { userId: user?.id || null, limit });
+        const text = items.length
+          ? items.map(t => `• ${t.type} • <t:${Math.floor(t.timestamp / 1000)}:R> • ${t.reason || "n/a"}`).join("\n")
+          : "No timeline entries.";
+        await interaction.reply({ embeds: [makeEmbed("Audit Timeline", text.slice(0, 3900), "info")] });
+        return;
+      }
+
+      if (cmd === "purgeplus") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const mode = String(interaction.options.getString("mode") || "").toLowerCase();
+        const limit = interaction.options.getInteger("limit");
+        const user = interaction.options.getUser("user");
+        const keyword = interaction.options.getString("keyword");
+        const minutes = interaction.options.getInteger("minutes");
+
+        if (!["all", "user", "keyword", "links", "attachments"].includes(mode)) {
+          await interaction.reply({ embeds: [makeEmbed("Invalid Mode", "Use all/user/keyword/links/attachments.", "error")], ephemeral: true });
+          return;
+        }
+        if (mode === "user" && !user) {
+          await interaction.reply({ embeds: [makeEmbed("Missing User", "Provide `user` when mode is user.", "error")], ephemeral: true });
+          return;
+        }
+        if (mode === "keyword" && !keyword) {
+          await interaction.reply({ embeds: [makeEmbed("Missing Keyword", "Provide `keyword` when mode is keyword.", "error")], ephemeral: true });
+          return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+        const result = await runAdvancedPurge(interaction.channel, {
+          mode,
+          limit,
+          userId: user?.id || null,
+          keyword,
+          minutes
+        });
+
+        governance.incrementAnalytics(interaction.guild.id, "advancedPurges", 1);
+        governance.appendTimeline({
+          guildId: interaction.guild.id,
+          type: "purgeplus",
+          actorId: interaction.user.id,
+          targetId: user?.id || null,
+          reason: `mode=${mode}`,
+          details: result
+        });
+        await interaction.editReply({
+          embeds: [makeEmbed("Advanced Purge Complete", `Scanned: **${result.scanned}**\nMatched: **${result.matched}**\nDeleted: **${result.deleted}**`, "success")]
+        });
+        return;
+      }
+
+      if (cmd === "lockdown") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+        const mode = String(interaction.options.getString("mode") || "").toLowerCase();
+        const confirm = interaction.options.getBoolean("confirm") === true;
+        if (!["on", "off", "panic"].includes(mode)) {
+          await interaction.reply({ embeds: [makeEmbed("Invalid Mode", "Use mode on/off/panic.", "error")], ephemeral: true });
+          return;
+        }
+        if (!confirm) {
+          await interaction.reply({ embeds: [makeEmbed("Confirmation Required", "Set `confirm=true` to run lockdown action.", "warn")], ephemeral: true });
+          return;
+        }
+
+        if (mode === "on" || mode === "panic") {
+          const state = { mode, setBy: interaction.user.id, setAt: Date.now(), channels: [] };
+          for (const ch of interaction.guild.channels.cache.values()) {
+            if (!ch.isTextBased?.() && ch.type !== ChannelType.GuildText) continue;
+            const before = ch.permissionOverwrites.cache.get(interaction.guild.id);
+            state.channels.push({
+              id: ch.id,
+              allow: before?.allow?.bitfield?.toString?.() || "0",
+              deny: before?.deny?.bitfield?.toString?.() || "0"
+            });
+            await ch.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false }).catch(() => {});
+          }
+          if (mode === "panic") {
+            await panicLockdown(interaction.guild, "Manual panic lockdown").catch(() => {});
+          }
+          governance.setLockdownState(interaction.guild.id, state);
+          governance.appendTimeline({
+            guildId: interaction.guild.id,
+            type: "lockdown-on",
+            actorId: interaction.user.id,
+            targetId: null,
+            reason: `Lockdown ${mode}`
+          });
+          await interaction.reply({ embeds: [makeEmbed("Lockdown Enabled", `Mode: **${mode}**`, "warn")] });
+          return;
+        }
+
+        const existing = governance.getLockdownState(interaction.guild.id);
+        if (!existing) {
+          await interaction.reply({ embeds: [makeEmbed("No Lockdown State", "No saved lockdown state found.", "warn")], ephemeral: true });
+          return;
+        }
+        for (const item of existing.channels || []) {
+          const ch = interaction.guild.channels.cache.get(item.id);
+          if (!ch) continue;
+          await ch.permissionOverwrites.edit(interaction.guild.id, { SendMessages: null }).catch(() => {});
+        }
+        governance.clearLockdownState(interaction.guild.id);
+        governance.appendTimeline({
+          guildId: interaction.guild.id,
+          type: "lockdown-off",
+          actorId: interaction.user.id,
+          targetId: null,
+          reason: "Lockdown disabled"
+        });
+        await interaction.reply({ embeds: [makeEmbed("Lockdown Disabled", "Channel restrictions restored to normal defaults.", "success")] });
+        return;
+      }
+
       if (cmd === "backup") {
         if (!canUseModCommand(member)) {
           await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
@@ -1635,7 +2344,7 @@ client.on(Events.InteractionCreate, async interaction => {
         if (action === "create") {
           const snapshot = createGuildBackupSnapshot(interaction.guild, interaction.user.id);
           backups.unshift(snapshot);
-          const maxStored = Math.max(1, config.backup?.maxStored || 20);
+          const maxStored = Math.max(1, currentConfig().backup?.maxStored || 20);
           const scopedCount = backups.filter(b => b.guildId === interaction.guild.id).length;
           if (scopedCount > maxStored) {
             let remaining = maxStored;
@@ -1671,8 +2380,11 @@ client.on(Events.InteractionCreate, async interaction => {
           return;
         }
 
-        if (action === "restore") {
-          const backupId = interaction.options.getString("backup_id");
+        if (action === "restore" || action === "restorelatest") {
+          const latest = backups.find(b => b.guildId === interaction.guild.id);
+          const backupId = action === "restorelatest"
+            ? latest?.id
+            : interaction.options.getString("backup_id");
           const confirm = interaction.options.getBoolean("confirm") === true;
           if (!backupId) {
             await interaction.reply({ embeds: [makeEmbed("Missing Backup ID", "Provide `backup_id` when using restore.", "error")], ephemeral: true });
@@ -1692,6 +2404,15 @@ client.on(Events.InteractionCreate, async interaction => {
             ephemeral: true
           });
           await sendTypedLog(interaction.guild, "security", "Backup Restore", `${interaction.user.tag} ran ${result.dryRun ? "dry-run" : "applied"} restore for ${snapshot.id}.`, result.dryRun ? "warn" : "error");
+          governance.incrementAnalytics(interaction.guild.id, result.dryRun ? "backupRestorePreviews" : "backupRestores", 1);
+          governance.appendTimeline({
+            guildId: interaction.guild.id,
+            type: "backup-restore",
+            actorId: interaction.user.id,
+            targetId: null,
+            reason: `${result.dryRun ? "preview" : "restore"} ${snapshot.id}`,
+            details: result
+          });
           return;
         }
 

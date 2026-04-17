@@ -70,12 +70,157 @@ module.exports = [
     options: [{ name: "user", type: 6, required: false, description: "User" }]
   },
   {
+    name: "case",
+    description: "View a moderation case by case ID.",
+    options: [{ name: "caseid", type: 3, required: true, description: "Case ID" }]
+  },
+  {
+    name: "cases",
+    description: "List recent moderation cases for a user.",
+    options: [
+      { name: "user", type: 6, required: true, description: "User" },
+      { name: "limit", type: 4, required: false, description: "1-20" }
+    ]
+  },
+  {
+    name: "history",
+    description: "View moderation/security history for a user.",
+    options: [{ name: "user", type: 6, required: true, description: "User" }]
+  },
+  {
+    name: "noteadd",
+    description: "Add an internal staff note for a user.",
+    options: [
+      { name: "user", type: 6, required: true, description: "User" },
+      { name: "text", type: 3, required: true, description: "Note content" }
+    ]
+  },
+  {
+    name: "notes",
+    description: "View staff notes for a user.",
+    options: [{ name: "user", type: 6, required: true, description: "User" }]
+  },
+  {
+    name: "noteremove",
+    description: "Remove a staff note by ID.",
+    options: [
+      { name: "user", type: 6, required: true, description: "User" },
+      { name: "noteid", type: 3, required: true, description: "Note ID" }
+    ]
+  },
+  {
     name: "backup",
     description: "Create, list, or restore a server backup.",
     options: [
-      { name: "action", type: 3, required: true, description: "create/list/restore" },
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "create/list/restore/restorelatest",
+        choices: [
+          { name: "create", value: "create" },
+          { name: "list", value: "list" },
+          { name: "restore", value: "restore" },
+          { name: "restorelatest", value: "restorelatest" }
+        ]
+      },
       { name: "backup_id", type: 3, required: false, description: "Backup ID for restore" },
       { name: "confirm", type: 5, required: false, description: "Set true to apply restore" }
+    ]
+  },
+  {
+    name: "lockdown",
+    description: "Set lockdown mode on/off/panic for this server.",
+    options: [
+      {
+        name: "mode",
+        type: 3,
+        required: true,
+        description: "on/off/panic",
+        choices: [
+          { name: "on", value: "on" },
+          { name: "off", value: "off" },
+          { name: "panic", value: "panic" }
+        ]
+      },
+      { name: "confirm", type: 5, required: false, description: "Set true to confirm" }
+    ]
+  },
+  {
+    name: "configview",
+    description: "View runtime config overrides for a group.",
+    options: [{
+      name: "group",
+      type: 3,
+      required: true,
+      description: "automod/antinuke/channels/backup",
+      choices: [
+        { name: "automod", value: "automod" },
+        { name: "antinuke", value: "antinuke" },
+        { name: "channels", value: "channels" },
+        { name: "backup", value: "backup" }
+      ]
+    }]
+  },
+  {
+    name: "configset",
+    description: "Set a runtime config value (no redeploy).",
+    options: [
+      {
+        name: "group",
+        type: 3,
+        required: true,
+        description: "automod/antinuke/channels/backup",
+        choices: [
+          { name: "automod", value: "automod" },
+          { name: "antinuke", value: "antinuke" },
+          { name: "channels", value: "channels" },
+          { name: "backup", value: "backup" }
+        ]
+      },
+      { name: "key", type: 3, required: true, description: "Key path (dot notation supported)" },
+      { name: "value", type: 3, required: true, description: "JSON/number/boolean/string value" }
+    ]
+  },
+  {
+    name: "stats",
+    description: "View moderation/security analytics.",
+    options: [{ name: "scope", type: 3, required: false, description: "overview/automod/security/traffic" }]
+  },
+  {
+    name: "risk",
+    description: "View a user's risk score.",
+    options: [{ name: "user", type: 6, required: true, description: "User" }]
+  },
+  {
+    name: "timeline",
+    description: "View audit trail timeline.",
+    options: [
+      { name: "user", type: 6, required: false, description: "User" },
+      { name: "limit", type: 4, required: false, description: "1-30" }
+    ]
+  },
+  {
+    name: "purgeplus",
+    description: "Advanced purge by filter.",
+    options: [
+      {
+        name: "mode",
+        type: 3,
+        required: true,
+        description: "all/user/keyword/links/attachments",
+        choices: [
+          { name: "all", value: "all" },
+          { name: "user", value: "user" },
+          { name: "keyword", value: "keyword" },
+          { name: "links", value: "links" },
+          { name: "attachments", value: "attachments" }
+        ]
+      },
+      { name: "limit", type: 4, required: true, description: "1-500 messages to scan" },
+      { name: "user", type: 6, required: false, description: "User (for mode=user)" },
+      { name: "keyword", type: 3, required: false, description: "Keyword (for mode=keyword)" },
+      { name: "minutes", type: 4, required: false, description: "Only include last X minutes" }
     ]
   },
   {

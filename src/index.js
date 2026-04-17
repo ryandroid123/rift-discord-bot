@@ -1282,17 +1282,26 @@ function createScheduledBackupsIfNeeded() {
 
   const all = loadBackups();
   for (const guild of client.guilds.cache.values()) {
-    const snapshot = createGuildBackupSnapshot(guild, client.user?.id || "system");
-    all.unshift(snapshot);
-    governance.incrementAnalytics(guild.id, "scheduledBackups", 1);
-    governance.appendTimeline({
-      guildId: guild.id,
-      type: "backup-scheduled",
-      actorId: client.user?.id || "system",
-      targetId: null,
-      reason: `Scheduled backup ${snapshot.id}`,
-      details: { backupId: snapshot.id }
-    });
+    try {
+      const snapshot = createGuildBackupSnapshot(guild, client.user?.id || "system");
+      if (!snapshot) {
+        console.error(`[backup] scheduled snapshot skipped for guild ${guild.id}: empty snapshot`);
+        continue;
+      }
+      all.unshift(snapshot);
+      governance.incrementAnalytics(guild.id, "scheduledBackups", 1);
+      governance.appendTimeline({
+        guildId: guild.id,
+        type: "backup-scheduled",
+        actorId: client.user?.id || "system",
+        targetId: null,
+        reason: `Scheduled backup ${snapshot.id}`,
+        details: { backupId: snapshot.id }
+      });
+    } catch (err) {
+      console.error(`[backup] scheduled snapshot failed for guild ${guild.id}:`, err);
+      continue;
+    }
   }
 
   const maxStored = Math.max(1, cfg.backup.maxStored || 20);
@@ -1306,6 +1315,14 @@ function createScheduledBackupsIfNeeded() {
   }
   saveBackups(kept);
   governance.setSchedulerState({ nextBackupAt: now + intervalMs, lastBackupAt: now });
+}
+
+function runScheduledBackupsSafely() {
+  try {
+    createScheduledBackupsIfNeeded();
+  } catch (err) {
+    console.error("[backup] scheduler guard caught error:", err);
+  }
 }
 
 function shouldSkipAntiNukeDuplicate(guildId, executorId, action, target = "") {
@@ -1435,9 +1452,9 @@ client.once(Events.ClientReady, async () => {
   }, 5 * 60 * 1000);
 
   setInterval(() => {
-    createScheduledBackupsIfNeeded();
+    runScheduledBackupsSafely();
   }, 5 * 60 * 1000);
-  createScheduledBackupsIfNeeded();
+  runScheduledBackupsSafely();
 
   startRiddleLoop();
 });

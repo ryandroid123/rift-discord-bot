@@ -21,51 +21,99 @@ function snapshotRole(role) {
 
 function snapshotOverwrites(channel, guild) {
   const out = [];
-  for (const overwrite of channel.permissionOverwrites.cache.values()) {
-    if (overwrite.type === 0) {
-      const role = guild.roles.cache.get(overwrite.id);
-      if (!role) continue;
-      out.push({
-        kind: "role",
-        name: role.name,
-        allow: overwrite.allow.bitfield.toString(),
-        deny: overwrite.deny.bitfield.toString()
-      });
+  const overwrites = channel?.permissionOverwrites?.cache;
+  if (!overwrites || typeof overwrites.values !== "function") return out;
+
+  for (const overwrite of overwrites.values()) {
+    try {
+      const allow = overwrite?.allow?.bitfield?.toString?.() || "0";
+      const deny = overwrite?.deny?.bitfield?.toString?.() || "0";
+      const overwriteType = overwrite?.type;
+
+      if (overwriteType === 0) {
+        const role = guild?.roles?.cache?.get?.(overwrite.id);
+        if (!role) continue;
+        out.push({
+          kind: "role",
+          name: role.name,
+          allow,
+          deny
+        });
+        continue;
+      }
+
+      if (overwrite?.id) {
+        out.push({
+          kind: "member",
+          id: overwrite.id,
+          allow,
+          deny
+        });
+      }
+    } catch {
       continue;
     }
-
-    out.push({
-      kind: "member",
-      id: overwrite.id,
-      allow: overwrite.allow.bitfield.toString(),
-      deny: overwrite.deny.bitfield.toString()
-    });
   }
+
   return out;
 }
 
 function snapshotChannel(channel, guild) {
+  if (!channel || typeof channel !== "object") return null;
+
+  let parentName = null;
+  try {
+    parentName = channel.parent?.name || null;
+  } catch {}
+
+  let position = 0;
+  try {
+    position = channel.rawPosition ?? channel.position ?? 0;
+  } catch {}
+
+  let topic = null;
+  try {
+    topic = channel.topic || null;
+  } catch {}
+
+  let nsfw = false;
+  try {
+    nsfw = !!channel.nsfw;
+  } catch {}
+
+  let rateLimitPerUser = 0;
+  try {
+    rateLimitPerUser = channel.rateLimitPerUser || 0;
+  } catch {}
+
   return {
-    name: channel.name,
+    name: channel.name || "unknown-channel",
     type: channel.type,
-    parentName: channel.parent?.name || null,
-    topic: channel.topic || null,
-    nsfw: !!channel.nsfw,
-    rateLimitPerUser: channel.rateLimitPerUser || 0,
-    position: channel.rawPosition ?? channel.position ?? 0,
+    parentName,
+    topic,
+    nsfw,
+    rateLimitPerUser,
+    position,
     permissionOverwrites: snapshotOverwrites(channel, guild)
   };
 }
 
 function createGuildBackupSnapshot(guild, createdBy) {
-  const roles = [...guild.roles.cache.values()]
+  const roles = [...(guild?.roles?.cache?.values?.() || [])]
     .filter(role => role.id !== guild.id)
     .sort((a, b) => a.position - b.position)
     .map(snapshotRole);
 
-  const channels = [...guild.channels.cache.values()]
+  const channels = [...(guild?.channels?.cache?.values?.() || [])]
     .sort((a, b) => (a.rawPosition ?? a.position ?? 0) - (b.rawPosition ?? b.position ?? 0))
-    .map(channel => snapshotChannel(channel, guild));
+    .map(channel => {
+      try {
+        return snapshotChannel(channel, guild);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
 
   return {
     id: buildBackupId(),

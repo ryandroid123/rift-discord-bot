@@ -21,6 +21,12 @@ npm install
 npm start
 ```
 
+## Persistence (Railway)
+- `DATA_DIR`: explicit absolute/relative path for bot JSON data (highest priority).
+- `RAILWAY_VOLUME_MOUNT_PATH`: if `DATA_DIR` is not set, data is stored in `${RAILWAY_VOLUME_MOUNT_PATH}/data`.
+- Fallback remains local `src/data`.
+- Data writes are atomic (`.tmp` + rename) and missing files are created safely.
+
 ## Required server setup
 Create these roles if they do not already exist:
 - Founder

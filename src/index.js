@@ -6,7 +6,6 @@ console.log("CLIENT_ID:", process.env.CLIENT_ID);
 console.log("GUILD_ID:", process.env.GUILD_ID);
 
 const fs = require("fs");
-const path = require("path");
 const ms = require("ms");
 const {
   Client,
@@ -29,7 +28,13 @@ const {
 const config = require("./config");
 const commands = require("./commands");
 const { makeEmbed } = require("./utils/embeds");
-const { readJson, writeJson } = require("./utils/storage");
+const {
+  readJson,
+  writeJson,
+  ensureDataFile,
+  resolveDataPath,
+  getDataDirInfo
+} = require("./utils/storage");
 const {
   getChannelByName,
   getCategoryByName,
@@ -53,18 +58,33 @@ const client = new Client({
   ]
 });
 
-const dataDir = path.join(__dirname, "data");
-const giveawaysPath = path.join(dataDir, "giveaways.json");
-const antinukePath = path.join(dataDir, "antinuke.json");
-const warningsPath = path.join(dataDir, "warnings.json");
-const statePath = path.join(dataDir, "state.json");
-const afkPath = path.join(dataDir, "afk.json");
-const snipePath = path.join(dataDir, "snipe.json");
+const { dataDir, source: dataDirSource } = getDataDirInfo();
+const giveawaysPath = resolveDataPath("giveaways.json");
+const antinukePath = resolveDataPath("antinuke.json");
+const warningsPath = resolveDataPath("warnings.json");
+const statePath = resolveDataPath("state.json");
+const afkPath = resolveDataPath("afk.json");
+const snipePath = resolveDataPath("snipe.json");
+const automodPath = resolveDataPath("automod.json");
+const moderationLogPath = resolveDataPath("moderation-log.json");
+const transcriptDir = resolveDataPath("transcripts");
 
-const spamCache = new Map();
+ensureDataFile("giveaways.json", []);
+ensureDataFile("streams.json", []);
+ensureDataFile("warnings.json", {});
+ensureDataFile("antinuke.json", {});
+ensureDataFile("state.json", { lastRiddleDate: null, inviteCounts: [] });
+ensureDataFile("afk.json", {});
+ensureDataFile("snipe.json", {});
+ensureDataFile("automod.json", {});
+ensureDataFile("moderation-log.json", []);
+if (!fs.existsSync(transcriptDir)) fs.mkdirSync(transcriptDir, { recursive: true });
+
+const automodCache = new Map();
 const giveawayTimers = new Map();
 const inviteCache = new Map();
 const memberInviteStats = new Map();
+const joinRaidCache = new Map();
 
 function logChannel(guild) {
   return getChannelByName(guild, config.channels.logs);
@@ -114,6 +134,343 @@ function saveSnipes(data) {
   writeJson(snipePath, data);
 }
 
+function loadAutomodState() {
+  return readJson(automodPath, {});
+}
+
+function saveAutomodState(data) {
+  writeJson(automodPath, data);
+}
+
+function appendModerationLog(entry) {
+  const items = readJson(moderationLogPath, []);
+  items.push(entry);
+  if (items.length > 5000) {
+    items.splice(0, items.length - 5000);
+  }
+  writeJson(moderationLogPath, items);
+}
+
+function getAutoModSettings() {
+  const automod = config.automod || {};
+  return {
+    enabled: automod.enabled !== false,
+    whitelistRoles: automod.whitelistRoles || [],
+    whitelistChannels: automod.whitelistChannels || [],
+    whitelistUserIds: automod.whitelistUserIds || [],
+    blockedWords: (automod.blockedWords || []).map(x => String(x).toLowerCase()),
+    blockedTerms: (automod.blockedTerms || []).map(x => String(x).toLowerCase()),
+    suspiciousLinkPatterns: (automod.suspiciousLinkPatterns || []).map(x => String(x).toLowerCase()),
+    maxMentions: automod.maxMentions ?? 5,
+    capsThreshold: automod.capsThreshold ?? 0.72,
+    capsMinLetters: automod.capsMinLetters ?? 12,
+    maxEmoji: automod.maxEmoji ?? 10,
+    maxLineBreaks: automod.maxLineBreaks ?? 10,
+    maxChars: automod.maxChars ?? 1200,
+    charFloodRepeat: automod.charFloodRepeat ?? 20,
+    maxZalgoMarks: automod.maxZalgoMarks ?? 10,
+    spamWindowMs: automod.spamWindowMs ?? 6000,
+    spamLimit: automod.spamLimit ?? 6,
+    repeatWindowMs: automod.repeatWindowMs ?? 8000,
+    repeatLimit: automod.repeatLimit ?? 3,
+    duplicateWindowMs: automod.duplicateWindowMs ?? 20000,
+    duplicateLimit: automod.duplicateLimit ?? 4,
+    repeatedLinkLimit: automod.repeatedLinkLimit ?? 3,
+    repeatedAttachmentLimit: automod.repeatedAttachmentLimit ?? 3,
+    capsBypassRoles: automod.capsBypassRoles || [],
+    timeoutThreshold: automod.timeoutThreshold ?? 2,
+    severeTimeoutThreshold: automod.severeTimeoutThreshold ?? 4,
+    severeTimeoutMs: automod.severeTimeoutMs ?? 60 * 60 * 1000,
+    timeoutMs: automod.timeoutMs ?? 10 * 60 * 1000,
+    kickThreshold: automod.kickThreshold ?? 6,
+    banThreshold: automod.banThreshold ?? 8,
+    allowKick: automod.allowKick === true,
+    allowBan: automod.allowBan === true,
+    antiInvite: automod.antiInvite !== false,
+    antiPhishing: automod.antiPhishing !== false
+  };
+}
+
+function getAntiNukeSettings() {
+  const antinuke = config.antinuke || {};
+  return {
+    threshold: antinuke.threshold ?? 3,
+    windowMs: antinuke.windowMs ?? 30000,
+    punishmentTimeoutMs: antinuke.punishmentTimeoutMs ?? 7 * 24 * 60 * 60 * 1000,
+    trustedUserIds: antinuke.trustedUserIds || [],
+    actionThresholds: antinuke.actionThresholds || {},
+    emergency: {
+      stripDangerousPermissions: antinuke.emergency?.stripDangerousPermissions !== false,
+      panicLockdown: antinuke.emergency?.panicLockdown !== false,
+      timeoutOffender: antinuke.emergency?.timeoutOffender !== false,
+      kickOffender: antinuke.emergency?.kickOffender === true,
+      banOffender: antinuke.emergency?.banOffender === true
+    }
+  };
+}
+
+function normalizeMessageText(text) {
+  return String(text || "")
+    .normalize("NFKC")
+    .replace(/[\u200B-\u200F\uFEFF\u2060]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function getMessageLinks(text) {
+  const matches = String(text || "").match(/(?:https?:\/\/[^\s<]+|discord(?:app)?\.com\/invite\/[^\s<]+|discord\.gg\/[^\s<]+)/gi);
+  return (matches || []).map(x => x.toLowerCase());
+}
+
+function getAttachmentFingerprints(message) {
+  if (!message.attachments?.size) return [];
+  return [...message.attachments.values()].map(a => `${a.name || "file"}:${a.size || 0}:${a.contentType || ""}`);
+}
+
+function countEmojiLike(content) {
+  const custom = (content.match(/<a?:\w+:\d+>/g) || []).length;
+  const unicode = (content.match(/\p{Extended_Pictographic}/gu) || []).length;
+  return custom + unicode;
+}
+
+function countZalgoMarks(content) {
+  return (content.match(/[\u0300-\u036f]/g) || []).length;
+}
+
+function detectSuspiciousUnicode(content) {
+  if (!content) return false;
+  const hasBiDi = /[\u202A-\u202E\u2066-\u2069]/.test(content);
+  const hasZeroWidth = /[\u200B-\u200F\uFEFF\u2060]/.test(content);
+  const normalized = content.normalize("NFKC");
+  const hasConfusableShift = normalized !== content && /[A-Za-z0-9]/.test(normalized);
+  return hasBiDi || hasZeroWidth || hasConfusableShift;
+}
+
+function isAutoModBypassed(message, settings) {
+  if (!settings.enabled) return true;
+  if (!message.member) return true;
+  if (message.member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  if (settings.whitelistUserIds.includes(message.author.id)) return true;
+  if (settings.whitelistChannels.includes(message.channel.id)) return true;
+  if (hasAnyRole(message.member, settings.whitelistRoles)) return true;
+  return false;
+}
+
+function getAutoModHistoryKey(message) {
+  return `${message.guild.id}:${message.author.id}`;
+}
+
+function getAutoModHistory(message, settings) {
+  const key = getAutoModHistoryKey(message);
+  const now = Date.now();
+  const maxWindow = Math.max(
+    settings.spamWindowMs,
+    settings.repeatWindowMs,
+    settings.duplicateWindowMs
+  );
+  const history = (automodCache.get(key) || []).filter(x => now - x.time <= maxWindow);
+  return { key, history, now };
+}
+
+function storeAutoModHistory(key, history, item) {
+  history.push(item);
+  if (history.length > 60) history.splice(0, history.length - 60);
+  automodCache.set(key, history);
+}
+
+function detectAutoModTrigger(message, settings) {
+  const content = message.content || "";
+  const lower = content.toLowerCase();
+  const links = getMessageLinks(content);
+  const attachments = getAttachmentFingerprints(message);
+  const normalized = normalizeMessageText(content);
+  const mentions = message.mentions.users.size + message.mentions.roles.size + (message.mentions.everyone ? 1 : 0);
+  const lineBreaks = (content.match(/\n/g) || []).length;
+  const emojiCount = countEmojiLike(content);
+  const zalgoMarks = countZalgoMarks(content);
+  const letters = content.replace(/[^a-z]/gi, "");
+  const caps = letters.replace(/[^A-Z]/g, "").length;
+  const bypassCaps = hasAnyRole(message.member, settings.capsBypassRoles || []);
+  const { key, history, now } = getAutoModHistory(message, settings);
+
+  const historyItem = {
+    time: now,
+    text: content,
+    normalized,
+    links,
+    attachments
+  };
+  storeAutoModHistory(key, history, historyItem);
+
+  const isInviteLink = settings.antiInvite && links.some(link =>
+    /discord(?:app)?\.com\/invite\/|discord\.gg\//i.test(link)
+  );
+  if (isInviteLink) {
+    return { rule: "invite-link", reason: "Invite link detected", evidence: links.join("\n").slice(0, 1000) };
+  }
+
+  const blockedHit = [...settings.blockedWords, ...settings.blockedTerms].find(term => term && lower.includes(term));
+  if (blockedHit) {
+    return { rule: "blocked-terms", reason: "Blocked term detected", evidence: blockedHit };
+  }
+
+  if (settings.antiPhishing) {
+    const suspiciousPattern = settings.suspiciousLinkPatterns.find(p => p && lower.includes(p));
+    if (suspiciousPattern) {
+      return { rule: "suspicious-link-pattern", reason: "Suspicious link pattern detected", evidence: suspiciousPattern };
+    }
+    const riskyLink = links.find(link =>
+      link.includes("@") ||
+      link.includes("xn--") ||
+      /https?:\/\/[^\/]+\.(zip|mov|click)(\/|$)/i.test(link)
+    );
+    if (riskyLink) {
+      return { rule: "phishing-heuristic", reason: "Potential phishing link detected", evidence: riskyLink };
+    }
+  }
+
+  if (mentions >= settings.maxMentions) {
+    return { rule: "mention-spam", reason: "Too many mentions", evidence: `${mentions} mentions` };
+  }
+
+  if (!bypassCaps && letters.length >= settings.capsMinLetters && caps / letters.length >= settings.capsThreshold) {
+    return { rule: "mass-caps", reason: "Excessive capitalization", evidence: `${caps}/${letters.length} capital letters` };
+  }
+
+  if (emojiCount >= settings.maxEmoji) {
+    return { rule: "emoji-spam", reason: "Too many emojis", evidence: `${emojiCount} emojis` };
+  }
+
+  if (lineBreaks >= settings.maxLineBreaks) {
+    return { rule: "line-break-flood", reason: "Too many line breaks", evidence: `${lineBreaks} line breaks` };
+  }
+
+  if (content.length >= settings.maxChars) {
+    return { rule: "char-flood", reason: "Message too long", evidence: `${content.length} characters` };
+  }
+
+  if (new RegExp(`(.)\\1{${Math.max(2, settings.charFloodRepeat)}}`).test(content)) {
+    return { rule: "character-repeat", reason: "Character flooding detected", evidence: "Repeated character sequence" };
+  }
+
+  if (zalgoMarks >= settings.maxZalgoMarks) {
+    return { rule: "zalgo-obfuscation", reason: "Excessive combining characters", evidence: `${zalgoMarks} combining marks` };
+  }
+
+  if (detectSuspiciousUnicode(content)) {
+    return { rule: "unicode-obfuscation", reason: "Suspicious Unicode obfuscation detected", evidence: "BiDi/zero-width/confusable Unicode patterns" };
+  }
+
+  const recentSpam = history.filter(x => now - x.time <= settings.spamWindowMs);
+  if (recentSpam.length >= settings.spamLimit) {
+    return { rule: "rapid-spam", reason: "Messages sent too quickly", evidence: `${recentSpam.length} messages in ${settings.spamWindowMs}ms` };
+  }
+
+  const recentRepeat = history.filter(x => now - x.time <= settings.repeatWindowMs);
+  const repeatedExact = recentRepeat.filter(x => x.text && x.text === content).length;
+  if (content && repeatedExact >= settings.repeatLimit) {
+    return { rule: "repeat-spam", reason: "Repeated identical messages", evidence: `${repeatedExact} repeated messages` };
+  }
+
+  const recentDuplicate = history.filter(x => now - x.time <= settings.duplicateWindowMs);
+  const repeatedNormalized = recentDuplicate.filter(x => x.normalized && x.normalized === normalized).length;
+  if (normalized && repeatedNormalized >= settings.duplicateLimit) {
+    return { rule: "duplicate-message", reason: "Duplicate/near-duplicate spam", evidence: `${repeatedNormalized} duplicate messages` };
+  }
+
+  if (links.length) {
+    const recentLinks = recentDuplicate.flatMap(x => x.links || []);
+    const repeatedLink = links.find(link => recentLinks.filter(existing => existing === link).length >= settings.repeatedLinkLimit);
+    if (repeatedLink) {
+      return { rule: "repeated-link-spam", reason: "Repeated link spam", evidence: repeatedLink };
+    }
+  }
+
+  if (attachments.length) {
+    const recentAttachments = recentDuplicate.flatMap(x => x.attachments || []);
+    const repeatedAttachment = attachments.find(att => recentAttachments.filter(existing => existing === att).length >= settings.repeatedAttachmentLimit);
+    if (repeatedAttachment) {
+      return { rule: "repeated-attachment-spam", reason: "Repeated attachment spam", evidence: repeatedAttachment };
+    }
+  }
+
+  return null;
+}
+
+async function applyAutoModAction(message, trigger) {
+  const settings = getAutoModSettings();
+  const member = message.member;
+  if (!member) return false;
+
+  await message.delete().catch(() => {});
+  const warningReason = `AutoMod (${trigger.rule}): ${trigger.reason}`;
+  const offences = addWarning(message.guild.id, message.author.id, "AutoMod", warningReason);
+
+  let action = "warn";
+  let actionDetail = "Warned user and removed message";
+
+  if (offences >= settings.banThreshold && settings.allowBan) {
+    action = "ban";
+    actionDetail = "Banned user for repeated AutoMod violations";
+    await message.guild.members.ban(message.author.id, { reason: `AutoMod: ${trigger.rule}` }).catch(() => {});
+  } else if (offences >= settings.kickThreshold && settings.allowKick) {
+    action = "kick";
+    actionDetail = "Kicked user for repeated AutoMod violations";
+    await member.kick(`AutoMod: ${trigger.rule}`).catch(() => {});
+  } else if (offences >= settings.severeTimeoutThreshold && member.moderatable) {
+    action = "timeout";
+    actionDetail = `Timed out for ${Math.floor(settings.severeTimeoutMs / 60000)} minutes`;
+    await member.timeout(settings.severeTimeoutMs, `AutoMod: ${trigger.rule}`).catch(() => {});
+  } else if (offences >= settings.timeoutThreshold && member.moderatable) {
+    action = "timeout";
+    actionDetail = `Timed out for ${Math.floor(settings.timeoutMs / 60000)} minutes`;
+    await member.timeout(settings.timeoutMs, `AutoMod: ${trigger.rule}`).catch(() => {});
+  }
+
+  await message.author.send({
+    embeds: [makeEmbed("AutoMod Action", `Rule: **${trigger.rule}**\nReason: ${trigger.reason}\nAction: **${actionDetail}**`, "warn")]
+  }).catch(() => {});
+
+  await sendLog(message.guild, "AutoMod Action", `${message.author.tag} triggered ${trigger.rule}.`, "warn", [
+    { name: "Rule", value: trigger.rule, inline: true },
+    { name: "Action", value: action, inline: true },
+    { name: "Warnings", value: String(offences), inline: true },
+    { name: "Evidence", value: (trigger.evidence || "n/a").slice(0, 1000) },
+    { name: "Message", value: (message.content || "[attachment-only]").slice(0, 1000) }
+  ]);
+
+  appendModerationLog({
+    type: "automod",
+    guildId: message.guild.id,
+    userId: message.author.id,
+    rule: trigger.rule,
+    reason: trigger.reason,
+    evidence: trigger.evidence || null,
+    action,
+    warnings: offences,
+    time: Date.now()
+  });
+
+  const state = loadAutomodState();
+  if (!state[message.guild.id]) state[message.guild.id] = {};
+  if (!state[message.guild.id][message.author.id]) {
+    state[message.guild.id][message.author.id] = {
+      totalActions: 0,
+      lastRule: null,
+      lastAction: null,
+      lastAt: null
+    };
+  }
+  state[message.guild.id][message.author.id].totalActions += 1;
+  state[message.guild.id][message.author.id].lastRule = trigger.rule;
+  state[message.guild.id][message.author.id].lastAction = action;
+  state[message.guild.id][message.author.id].lastAt = Date.now();
+  saveAutomodState(state);
+
+  return true;
+}
+
 function canUseModCommand(member) {
   return hasAnyRole(member, ["Founder", "Admin", "Moderator"]);
 }
@@ -128,7 +485,7 @@ async function sendTranscript(guild, ticketChannel, lines) {
   const ch = transcriptChannel(guild);
   if (!ch) return;
 
-  const filePath = path.join(dataDir, `${ticketChannel.name}-${Date.now()}.txt`);
+  const filePath = resolveDataPath("transcripts", `${ticketChannel.name}-${Date.now()}.txt`);
   fs.writeFileSync(filePath, lines.join("\n"), "utf8");
 
   await ch.send({
@@ -312,44 +669,177 @@ function scheduleGiveaway(giveaway) {
   giveawayTimers.set(giveaway.messageId, timer);
 }
 
-function recordAntiNuke(guildId, userId, action) {
-  const data = readJson(antinukePath, {});
-  if (!data[guildId]) data[guildId] = {};
-  if (!data[guildId][userId]) data[guildId][userId] = [];
-
-  const now = Date.now();
-  data[guildId][userId] = data[guildId][userId].filter(x => now - x.time <= config.antinuke.windowMs);
-  data[guildId][userId].push({ action, time: now });
-
-  writeJson(antinukePath, data);
-  return data[guildId][userId].length;
+function isTrustedAntiNukeActor(guild, member, settings) {
+  if (!member) return true;
+  if (member.id === guild.ownerId) return true;
+  if (member.user?.bot) return settings.trustedUserIds.includes(member.id);
+  if (settings.trustedUserIds.includes(member.id)) return true;
+  return false;
 }
 
-async function antiNukeCheck(guild, executorId, action) {
+function getDangerousPermissionFlags() {
+  return [
+    PermissionsBitField.Flags.Administrator,
+    PermissionsBitField.Flags.ManageGuild,
+    PermissionsBitField.Flags.ManageRoles,
+    PermissionsBitField.Flags.ManageChannels,
+    PermissionsBitField.Flags.BanMembers,
+    PermissionsBitField.Flags.KickMembers,
+    PermissionsBitField.Flags.ModerateMembers,
+    PermissionsBitField.Flags.ManageWebhooks
+  ];
+}
+
+async function stripDangerousPermsFromMember(member, reason) {
+  for (const role of member.roles.cache.values()) {
+    if (role.managed || role.id === member.guild.id || !role.editable) continue;
+    const perms = new PermissionsBitField(role.permissions.bitfield);
+    const before = perms.bitfield;
+    perms.remove(...getDangerousPermissionFlags());
+    if (perms.bitfield !== before) {
+      await role.setPermissions(perms, reason).catch(() => {});
+    }
+  }
+}
+
+function recordAntiNuke(guildId, userId, action, settings) {
+  const data = readJson(antinukePath, {});
+  if (!data[guildId]) data[guildId] = {};
+  if (!data[guildId][userId]) data[guildId][userId] = { events: [] };
+
+  if (Array.isArray(data[guildId][userId])) {
+    data[guildId][userId] = { events: data[guildId][userId] };
+  }
+  if (!Array.isArray(data[guildId][userId].events)) {
+    data[guildId][userId].events = [];
+  }
+
+  const now = Date.now();
+  const actionCfg = settings.actionThresholds[action] || {};
+  const actionWindowMs = actionCfg.windowMs ?? settings.windowMs;
+  const actionThreshold = actionCfg.threshold ?? settings.threshold;
+
+  const history = data[guildId][userId].events.filter(x => now - x.time <= Math.max(actionWindowMs, settings.windowMs));
+  history.push({ action, time: now });
+  data[guildId][userId].events = history;
+  writeJson(antinukePath, data);
+
+  const actionCount = history.filter(x => x.action === action && now - x.time <= actionWindowMs).length;
+  const globalCount = history.filter(x => now - x.time <= settings.windowMs).length;
+
+  return {
+    actionCount,
+    globalCount,
+    actionThreshold,
+    globalThreshold: settings.threshold
+  };
+}
+
+async function antiNukeCheck(guild, executorId, action, extra = {}) {
+  const settings = getAntiNukeSettings();
   const member = await guild.members.fetch(executorId).catch(() => null);
   if (!member) return;
-  if (!hasStaffRole(member)) return;
+  if (isTrustedAntiNukeActor(guild, member, settings)) return;
+  if (!hasStaffRole(member) && !member.permissions.has(PermissionFlagsBits.ManageGuild)) return;
 
-  const count = recordAntiNuke(guild.id, executorId, action);
+  const counts = recordAntiNuke(guild.id, executorId, action, settings);
 
   await sendLog(guild, "Anti-Nuke Alert", `Suspicious action detected: ${action}`, "warn", [
     { name: "User", value: member.user.tag, inline: true },
-    { name: "Count", value: String(count), inline: true }
+    { name: "Action Count", value: String(counts.actionCount), inline: true },
+    { name: "Global Count", value: String(counts.globalCount), inline: true },
+    { name: "Target", value: extra.target || "n/a", inline: true }
   ]);
 
-  if (count >= config.antinuke.threshold) {
-    if (member.moderatable) {
-      await member.timeout(config.antinuke.punishmentTimeoutMs, "Anti-nuke triggered").catch(() => {});
-    }
-    await panicLockdown(guild, "Anti-nuke lockdown triggered").catch(() => {});
-    await sendLog(guild, "Anti-Nuke Action", `${member.user.tag} hit the threshold. Timeout + lockdown triggered.`, "error");
+  appendModerationLog({
+    type: "antinuke-alert",
+    guildId: guild.id,
+    userId: member.id,
+    action,
+    counts,
+    target: extra.target || null,
+    time: Date.now()
+  });
+
+  const shouldPunish = counts.actionCount >= counts.actionThreshold || counts.globalCount >= counts.globalThreshold;
+  if (!shouldPunish) return;
+
+  const reason = `Anti-nuke triggered (${action})`;
+  if (settings.emergency.stripDangerousPermissions) {
+    await stripDangerousPermsFromMember(member, reason);
   }
+  if (settings.emergency.timeoutOffender && member.moderatable) {
+    await member.timeout(settings.punishmentTimeoutMs, reason).catch(() => {});
+  }
+  if (settings.emergency.kickOffender && member.kickable) {
+    await member.kick(reason).catch(() => {});
+  }
+  if (settings.emergency.banOffender) {
+    await guild.members.ban(member.id, { reason }).catch(() => {});
+  }
+  if (settings.emergency.panicLockdown) {
+    await panicLockdown(guild, "Anti-nuke lockdown triggered").catch(() => {});
+  }
+
+  await sendLog(guild, "Anti-Nuke Action", `${member.user.tag} hit anti-nuke thresholds. Emergency response executed.`, "error", [
+    { name: "Action", value: action, inline: true },
+    { name: "Action Count", value: String(counts.actionCount), inline: true },
+    { name: "Global Count", value: String(counts.globalCount), inline: true }
+  ]);
+
+  appendModerationLog({
+    type: "antinuke-action",
+    guildId: guild.id,
+    userId: member.id,
+    action,
+    counts,
+    emergency: settings.emergency,
+    time: Date.now()
+  });
 }
 
 async function cacheInvitesForGuild(guild) {
   const invites = await guild.invites.fetch().catch(() => null);
   if (!invites) return;
   inviteCache.set(guild.id, new Map(invites.map(inv => [inv.code, inv.uses || 0])));
+}
+
+async function checkJoinRaid(member) {
+  const antiRaid = config.automod?.antiRaid || {};
+  const enabled = antiRaid.enabled !== false;
+  if (!enabled) return;
+
+  const windowMs = antiRaid.windowMs ?? 15000;
+  const joinLimit = antiRaid.joinLimit ?? 8;
+  const action = antiRaid.action || "log";
+  const key = member.guild.id;
+  const now = Date.now();
+  const timestamps = (joinRaidCache.get(key) || []).filter(t => now - t <= windowMs);
+  timestamps.push(now);
+  joinRaidCache.set(key, timestamps);
+
+  if (timestamps.length < joinLimit) return;
+
+  await sendLog(member.guild, "Anti-Raid Alert", `Join spike detected: ${timestamps.length} joins in ${Math.floor(windowMs / 1000)}s.`, "warn");
+  appendModerationLog({
+    type: "anti-raid",
+    guildId: member.guild.id,
+    joinCount: timestamps.length,
+    windowMs,
+    time: now
+  });
+
+  if (action === "lockdown") {
+    await panicLockdown(member.guild, "Anti-raid lockdown triggered").catch(() => {});
+    await sendLog(member.guild, "Anti-Raid Action", "Panic lockdown triggered by join spike.", "error");
+  } else if (action === "slowmode") {
+    const chat = getChannelByName(member.guild, config.channels.chat);
+    const seconds = antiRaid.slowmodeSeconds ?? 10;
+    if (chat?.manageable) {
+      await chat.setRateLimitPerUser(seconds).catch(() => {});
+      await sendLog(member.guild, "Anti-Raid Action", `Applied ${seconds}s slowmode to ${chat}.`, "warn");
+    }
+  }
 }
 
 function londonNowParts() {
@@ -425,21 +915,34 @@ function getWarnings(guildId, userId) {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  console.log(`Data directory: ${dataDir} (source: ${dataDirSource})`);
 
   const giveaways = loadGiveaways();
+  let scheduled = 0;
+  let recoveredEnded = 0;
   for (const g of giveaways) {
-    if (!g.ended) scheduleGiveaway(g);
+    if (g.ended) continue;
+    if (typeof g.endsAt === "number" && g.endsAt <= Date.now()) {
+      await endGiveaway(g.messageId).catch(() => {});
+      recoveredEnded += 1;
+      continue;
+    }
+    scheduleGiveaway(g);
+    scheduled += 1;
   }
-  console.log(`Rescheduled ${giveaways.length} giveaways`);
+  console.log(`Giveaway recovery complete. Scheduled: ${scheduled}, ended on startup: ${recoveredEnded}, total records: ${giveaways.length}`);
 
   setInterval(() => {
     checkStreams(client, config, makeEmbed).catch(() => {});
-  }, 2 * 60 * 1000);
+  }, config.social?.checkIntervalMs || 2 * 60 * 1000);
+  checkStreams(client, config, makeEmbed).catch(() => {});
 
   startRiddleLoop();
 });
 
 client.on(Events.GuildMemberAdd, async member => { 
+  await checkJoinRaid(member).catch(() => {});
+
   const role = getRoleByName(member.guild, config.autoRole);
   if (role) {
     await member.roles.add(role).catch(() => {});
@@ -537,110 +1040,50 @@ client.on(Events.MessageCreate, async message => {
     }
   });
 
-  const lower = message.content.toLowerCase();
+  const settings = getAutoModSettings();
+  if (isAutoModBypassed(message, settings)) return;
 
-  for (const blocked of config.automod.blockedWords) {
-    if (lower.includes(blocked)) {
-      await message.delete().catch(() => {});
-      await sendLog(message.guild, "AutoMod", `Blocked word/invite removed from ${message.author.tag}.`, "warn");
-      return;
-    }
-  }
+  const trigger = detectAutoModTrigger(message, settings);
+  if (!trigger) return;
 
-  for (const pattern of config.automod.suspiciousLinkPatterns) {
-    if (lower.includes(pattern)) {
-      await message.delete().catch(() => {});
-      await sendLog(message.guild, "AutoMod", `Suspicious link removed from ${message.author.tag}.`, "warn");
-      return;
-    }
-  }
-
-  if (message.mentions.users.size >= config.automod.maxMentions) {
-    await message.delete().catch(() => {});
-    await sendLog(message.guild, "AutoMod", `Mention spam removed from ${message.author.tag}.`, "warn");
-    return;
-  }
-
-  const letters = message.content.replace(/[^a-z]/gi, "");
-  const caps = letters.replace(/[^A-Z]/g, "").length;
-  const bypassCaps = hasAnyRole(message.member, config.automod.capsBypassRoles || []);
-
-  if (!bypassCaps && letters.length >= config.automod.capsMinLetters && caps / letters.length >= config.automod.capsThreshold) {
-    await message.delete().catch(() => {});
-    await sendLog(message.guild, "AutoMod", `Caps spam removed from ${message.author.tag}.`, "warn");
-    return;
-  }
-
-  const key = `${message.guild.id}:${message.author.id}`;
-  const now = Date.now();
-  const arr = (spamCache.get(key) || []).filter(x => now - x.time <= 3000);
-  arr.push({ time: now, text: message.content });
-  spamCache.set(key, arr);
-
-  const repeats = arr.filter(x => x.text === message.content).length;
-  const isRepeatSpam = repeats >= 3;
-  const isRapidSpam = arr.length >= 5;
-
-  if (isRepeatSpam || isRapidSpam) {
-    spamCache.set(key, []);
-    await message.delete().catch(() => {});
-
-    const offences = addWarning(message.guild.id, message.author.id, "AutoMod", "Spamming");
-    const member = message.member;
-    const reason = isRepeatSpam ? "Repeated identical messages" : "Sending messages too fast";
-
-    let actionText = "";
-    let dmText = "";
-
-    if (offences === 1) {
-      actionText = "Warned";
-      dmText = `You have been **warned** in **${message.guild.name}** for spamming.\nReason: ${reason}\n\nPlease stop or further action will be taken.`;
-    } else if (offences === 2) {
-      actionText = "Timed out for 5 minutes";
-      dmText = `You have been **timed out for 5 minutes** in **${message.guild.name}** for spamming.\nReason: ${reason}\n\nThis is your second offence.`;
-      if (member?.moderatable) await member.timeout(5 * 60 * 1000, "AutoMod: Spamming").catch(() => {});
-    } else if (offences === 3) {
-      actionText = "Timed out for 1 hour";
-      dmText = `You have been **timed out for 1 hour** in **${message.guild.name}** for spamming.\nReason: ${reason}\n\nThis is your third offence.`;
-      if (member?.moderatable) await member.timeout(60 * 60 * 1000, "AutoMod: Spamming").catch(() => {});
-    } else {
-      actionText = "Banned";
-      dmText = `You have been **banned** from **${message.guild.name}** for repeated spamming.\nReason: ${reason}\n\nTo appeal your ban, DM @kz1m or @NotLuigiBro on Discord.`;
-      await message.guild.members.ban(message.author.id, { reason: "AutoMod: Repeated spamming" }).catch(() => {});
-    }
-
-    await message.author.send({
-      embeds: [makeEmbed("AutoMod Action", dmText, "error")]
-    }).catch(() => {});
-
-    await sendLog(message.guild, "AutoMod Spam", `${message.author.tag} was actioned for spamming.`, "warn", [
-      { name: "Action", value: actionText, inline: true },
-      { name: "Offences", value: String(offences), inline: true },
-      { name: "Reason", value: reason, inline: true }
-    ]);
-
-    return;
-  }
+  await applyAutoModAction(message, trigger);
+  return;
 });
 
-async function fetchExecutor(guild, type) {
-  const logs = await guild.fetchAuditLogs({ type, limit: 1 }).catch(() => null);
-  return logs?.entries?.first()?.executorId || null;
+async function fetchExecutor(guild, type, targetId = null, maxAgeMs = 30000) {
+  const logs = await guild.fetchAuditLogs({ type, limit: 6 }).catch(() => null);
+  if (!logs?.entries?.size) return null;
+
+  const now = Date.now();
+  for (const entry of logs.entries.values()) {
+    const created = entry.createdTimestamp || 0;
+    if (now - created > maxAgeMs) continue;
+    if (targetId && entry.targetId && entry.targetId !== targetId) continue;
+    return entry.executorId || null;
+  }
+
+  return null;
 }
 
 client.on(Events.ChannelDelete, async channel => {
   if (channel.guild) {
     await sendLog(channel.guild, "Channel Deleted", `${channel.name} was deleted.`, "error");
-    const executorId = await fetchExecutor(channel.guild, AuditLogEvent.ChannelDelete);
-    if (executorId) await antiNukeCheck(channel.guild, executorId, "channel delete");
+    const executorId = await fetchExecutor(channel.guild, AuditLogEvent.ChannelDelete, channel.id);
+    if (executorId) {
+      await antiNukeCheck(channel.guild, executorId, "channelDelete", { target: channel.name });
+    } else {
+      await sendLog(channel.guild, "Anti-Nuke Notice", "Could not attribute channel delete from audit logs.", "warn");
+    }
   }
 });
 
 client.on(Events.ChannelCreate, async channel => {
   if (channel.guild) {
     await sendLog(channel.guild, "Channel Created", `${channel.name} was created.`, "success");
-    const executorId = await fetchExecutor(channel.guild, AuditLogEvent.ChannelCreate);
-    if (executorId) await antiNukeCheck(channel.guild, executorId, "channel create");
+    const executorId = await fetchExecutor(channel.guild, AuditLogEvent.ChannelCreate, channel.id);
+    if (executorId) {
+      await antiNukeCheck(channel.guild, executorId, "channelCreate", { target: channel.name });
+    }
   }
 });
 
@@ -653,16 +1096,16 @@ client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
 client.on(Events.RoleDelete, async role => {
   if (role.guild) {
     await sendLog(role.guild, "Role Deleted", `${role.name} was deleted.`, "error");
-    const executorId = await fetchExecutor(role.guild, AuditLogEvent.RoleDelete);
-    if (executorId) await antiNukeCheck(role.guild, executorId, "role delete");
+    const executorId = await fetchExecutor(role.guild, AuditLogEvent.RoleDelete, role.id);
+    if (executorId) await antiNukeCheck(role.guild, executorId, "roleDelete", { target: role.name });
   }
 });
 
 client.on(Events.RoleCreate, async role => {
   if (role.guild) {
     await sendLog(role.guild, "Role Created", `${role.name} was created.`, "success");
-    const executorId = await fetchExecutor(role.guild, AuditLogEvent.RoleCreate);
-    if (executorId) await antiNukeCheck(role.guild, executorId, "role create");
+    const executorId = await fetchExecutor(role.guild, AuditLogEvent.RoleCreate, role.id);
+    if (executorId) await antiNukeCheck(role.guild, executorId, "roleCreate", { target: role.name });
   }
 });
 
@@ -673,26 +1116,45 @@ client.on(Events.RoleUpdate, async (oldRole, newRole) => {
 
   const before = new PermissionsBitField(oldRole.permissions.bitfield);
   const after = new PermissionsBitField(newRole.permissions.bitfield);
-  const dangerous = [
-    PermissionsBitField.Flags.Administrator,
-    PermissionsBitField.Flags.ManageRoles,
-    PermissionsBitField.Flags.ManageChannels,
-    PermissionsBitField.Flags.BanMembers,
-    PermissionsBitField.Flags.KickMembers,
-    PermissionsBitField.Flags.ManageWebhooks
-  ];
+  const dangerous = getDangerousPermissionFlags();
   const escalated = dangerous.some(flag => !before.has(flag) && after.has(flag));
   if (!escalated) return;
 
-  const executorId = await fetchExecutor(newRole.guild, AuditLogEvent.RoleUpdate);
-  if (executorId) await antiNukeCheck(newRole.guild, executorId, "dangerous role permission escalation");
+  const executorId = await fetchExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
+  if (executorId) await antiNukeCheck(newRole.guild, executorId, "rolePermissionEscalation", { target: newRole.name });
 });
 
 client.on(Events.WebhooksUpdate, async channel => {
   if (!channel.guild) return;
   await sendLog(channel.guild, "Webhook Update", `Webhook update detected in ${channel.name}.`, "warn");
-  const executorId = await fetchExecutor(channel.guild, AuditLogEvent.WebhookCreate);
-  if (executorId) await antiNukeCheck(channel.guild, executorId, "webhook update");
+  const executorCreate = await fetchExecutor(channel.guild, AuditLogEvent.WebhookCreate, null, 20000);
+  const executorDelete = await fetchExecutor(channel.guild, AuditLogEvent.WebhookDelete, null, 20000);
+  const executorUpdate = await fetchExecutor(channel.guild, AuditLogEvent.WebhookUpdate, null, 20000);
+  const executorId = executorCreate || executorDelete || executorUpdate;
+  if (executorId) await antiNukeCheck(channel.guild, executorId, "webhookChange", { target: channel.name });
+});
+
+client.on(Events.GuildBanAdd, async ban => {
+  const executorId = await fetchExecutor(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id);
+  if (executorId) await antiNukeCheck(ban.guild, executorId, "memberBan", { target: ban.user.tag });
+});
+
+client.on(Events.GuildAuditLogEntryCreate, async entry => {
+  const guild = entry.guild;
+  const executorId = entry.executorId;
+  if (!guild || !executorId) return;
+
+  let action = null;
+  if (entry.action === AuditLogEvent.MemberKick) action = "memberKick";
+  if (entry.action === AuditLogEvent.MemberUpdate && entry.changes?.some(c => c.key === "communication_disabled_until")) action = "memberTimeout";
+  if (entry.action === AuditLogEvent.MemberPrune) action = "memberPrune";
+  if (entry.action === AuditLogEvent.GuildUpdate) action = "guildUpdate";
+  if (entry.action === AuditLogEvent.BotAdd) action = "botAdd";
+  if (!action) return;
+
+  await antiNukeCheck(guild, executorId, action, {
+    target: entry.target?.tag || entry.target?.name || entry.targetId || "unknown"
+  });
 });
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -1169,7 +1631,7 @@ if (cmd === "poll") {
 
       if (cmd === "addstream") {
         const name = interaction.options.getString("name");
-        const platform = interaction.options.getString("platform");
+        const platform = String(interaction.options.getString("platform") || "").trim().toLowerCase();
         const handle = interaction.options.getString("handle");
 
         const streams = loadStreams();

@@ -40,6 +40,10 @@ module.exports = {
   ],
 
   automod: {
+    enabled: true,
+    whitelistRoles: ["Founder"],
+    whitelistChannels: [],
+    whitelistUserIds: [],
     blockedWords: [
       "discord.gg/",
       "discord.com/invite/",
@@ -48,6 +52,7 @@ module.exports = {
       "faggot",
       "kys"
     ],
+    blockedTerms: [],
     suspiciousLinkPatterns: [
       "grabify",
       "iplogger",
@@ -56,18 +61,68 @@ module.exports = {
       "t.ly",
       "goo.gl"
     ],
+    antiInvite: true,
+    antiPhishing: true,
     maxMentions: 5,
     capsThreshold: 0.72,
     capsMinLetters: 12,
+    maxEmoji: 10,
+    maxLineBreaks: 10,
+    maxChars: 1200,
+    charFloodRepeat: 20,
+    maxZalgoMarks: 10,
+    spamWindowMs: 6000,
+    spamLimit: 6,
     repeatWindowMs: 8000,
-    repeatLimit: 4,
-    capsBypassRoles: ["Founder"]
+    repeatLimit: 3,
+    duplicateWindowMs: 20000,
+    duplicateLimit: 4,
+    repeatedLinkLimit: 3,
+    repeatedAttachmentLimit: 3,
+    timeoutThreshold: 2,
+    timeoutMs: 10 * 60 * 1000,
+    severeTimeoutThreshold: 4,
+    severeTimeoutMs: 60 * 60 * 1000,
+    kickThreshold: 6,
+    banThreshold: 8,
+    allowKick: false,
+    allowBan: false,
+    capsBypassRoles: ["Founder"],
+    antiRaid: {
+      enabled: true,
+      windowMs: 15000,
+      joinLimit: 8,
+      action: "log",
+      slowmodeSeconds: 10
+    }
   },
 
   antinuke: {
     threshold: 3,
     windowMs: 30000,
-    punishmentTimeoutMs: 7 * 24 * 60 * 60 * 1000
+    punishmentTimeoutMs: 7 * 24 * 60 * 60 * 1000,
+    trustedUserIds: [],
+    actionThresholds: {
+      channelDelete: { threshold: 2, windowMs: 20000 },
+      channelCreate: { threshold: 6, windowMs: 20000 },
+      roleDelete: { threshold: 2, windowMs: 20000 },
+      roleCreate: { threshold: 6, windowMs: 20000 },
+      rolePermissionEscalation: { threshold: 2, windowMs: 30000 },
+      webhookChange: { threshold: 3, windowMs: 20000 },
+      memberBan: { threshold: 4, windowMs: 20000 },
+      memberKick: { threshold: 5, windowMs: 20000 },
+      memberTimeout: { threshold: 8, windowMs: 20000 },
+      memberPrune: { threshold: 1, windowMs: 30000 },
+      guildUpdate: { threshold: 3, windowMs: 30000 },
+      botAdd: { threshold: 2, windowMs: 30000 }
+    },
+    emergency: {
+      stripDangerousPermissions: true,
+      panicLockdown: true,
+      timeoutOffender: true,
+      kickOffender: false,
+      banOffender: false
+    }
   },
 
   social: {

@@ -1,8 +1,8 @@
 const fetch = require("node-fetch");
-const path = require("path");
-const { readJson, writeJson } = require("./storage");
+const { readJson, writeJson, ensureDataFile, resolveDataPath } = require("./storage");
 
-const streamsPath = path.join(__dirname, "../data/streams.json");
+const streamsPath = resolveDataPath("streams.json");
+ensureDataFile("streams.json", []);
 const sentCache = new Set();
 
 function normalizePlatform(platform) {

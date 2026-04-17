@@ -93,6 +93,44 @@ const logQueueByChannel = new Map();
 const streamCheckState = { running: false };
 const antiNukeDedupe = new Map();
 const coordinatedSpamCache = new Map();
+let startupCompleted = false;
+
+function logRuntimeError(label, error) {
+  if (!error) {
+    console.error(`[runtime] ${label}: unknown error`);
+    return;
+  }
+  if (error instanceof Error) {
+    console.error(`[runtime] ${label}: ${error.message}\n${error.stack || ""}`);
+    return;
+  }
+  console.error(`[runtime] ${label}:`, error);
+}
+
+async function runStartupTask(name, fn, options = {}) {
+  const critical = options.critical === true;
+  console.log(`[startup] starting: ${name}`);
+  try {
+    await fn();
+    console.log(`[startup] finished: ${name}`);
+    return true;
+  } catch (err) {
+    logRuntimeError(`[startup] failed: ${name}`, err);
+    if (critical) throw err;
+    return false;
+  }
+}
+
+function runIntervalSafely(name, fn) {
+  try {
+    const result = fn();
+    if (result && typeof result.then === "function") {
+      result.catch(err => logRuntimeError(`[interval] ${name}`, err));
+    }
+  } catch (err) {
+    logRuntimeError(`[interval] ${name}`, err);
+  }
+}
 
 function logChannel(guild) {
   const cfg = governance.mergeWithRuntime(config);
@@ -1249,8 +1287,11 @@ async function runStreamChecksSafely() {
   streamCheckState.running = true;
   try {
     await checkStreams(client, config, makeEmbed);
-  } catch {}
-  streamCheckState.running = false;
+  } catch (err) {
+    logRuntimeError("stream-check", err);
+  } finally {
+    streamCheckState.running = false;
+  }
 }
 
 async function monitorGuildIntegrity(guild) {
@@ -1267,7 +1308,9 @@ async function monitorGuildIntegrity(guild) {
 
 async function runMonitorLoop() {
   for (const guild of client.guilds.cache.values()) {
-    await monitorGuildIntegrity(guild).catch(() => {});
+    await monitorGuildIntegrity(guild).catch(err => {
+      logRuntimeError(`integrity-monitor guild ${guild.id}`, err);
+    });
   }
 }
 
@@ -1412,51 +1455,74 @@ function getWarnings(guildId, userId) {
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Data directory: ${dataDir} (source: ${dataDirSource})`);
-  const storedInviteCounts = loadInviteCountsFromState();
-  for (const [key, value] of storedInviteCounts.entries()) {
-    memberInviteStats.set(key, value);
+  console.log("[startup] post-ready startup sequence started");
+
+  try {
+    await runStartupTask("restore invite counters from state", async () => {
+      const storedInviteCounts = loadInviteCountsFromState();
+      for (const [key, value] of storedInviteCounts.entries()) {
+        memberInviteStats.set(key, value);
+      }
+    });
+
+    await runStartupTask("recover giveaways and schedule timers", async () => {
+      const giveaways = loadGiveaways();
+      let scheduled = 0;
+      let recoveredEnded = 0;
+      for (const g of giveaways) {
+        if (g.ended) continue;
+        if (typeof g.endsAt === "number" && g.endsAt <= Date.now()) {
+          await endGiveaway(g.messageId).catch(() => {});
+          recoveredEnded += 1;
+          continue;
+        }
+        scheduleGiveaway(g);
+        scheduled += 1;
+      }
+      console.log(`Giveaway recovery complete. Scheduled: ${scheduled}, ended on startup: ${recoveredEnded}, total records: ${giveaways.length}`);
+    });
+
+    await runStartupTask("cache guild invites", async () => {
+      const jobs = [];
+      for (const guild of client.guilds.cache.values()) {
+        jobs.push(cacheInvitesForGuild(guild).catch(err => {
+          logRuntimeError(`[startup] cacheInvitesForGuild ${guild.id}`, err);
+        }));
+      }
+      await Promise.all(jobs);
+    });
+
+    await runStartupTask("start stream scheduler and initial stream check", async () => {
+      const streamIntervalMs = config.social?.checkIntervalMs || 2 * 60 * 1000;
+      setInterval(() => runIntervalSafely("stream-check", () => runStreamChecksSafely()), streamIntervalMs);
+      await runStreamChecksSafely();
+    });
+
+    await runStartupTask("start integrity monitor scheduler and initial pass", async () => {
+      const antinukeCfg = currentConfig().antinuke || {};
+      const intervalMs = Math.max(15000, antinukeCfg.realtimeMonitorIntervalMs || 45000);
+      setInterval(() => runIntervalSafely("integrity-monitor", () => runMonitorLoop()), intervalMs);
+      await runMonitorLoop();
+    });
+
+    await runStartupTask("start risk decay scheduler", async () => {
+      setInterval(() => runIntervalSafely("risk-decay", () => governance.decayRiskAll(1)), 5 * 60 * 1000);
+    });
+
+    await runStartupTask("start backup scheduler and initial scheduled backup pass", async () => {
+      setInterval(() => runIntervalSafely("scheduled-backups", () => runScheduledBackupsSafely()), 5 * 60 * 1000);
+      runScheduledBackupsSafely();
+    });
+
+    await runStartupTask("start riddle loop", async () => {
+      startRiddleLoop();
+    });
+  } catch (err) {
+    logRuntimeError("[startup] unexpected failure in startup sequence", err);
   }
 
-  const giveaways = loadGiveaways();
-  let scheduled = 0;
-  let recoveredEnded = 0;
-  for (const g of giveaways) {
-    if (g.ended) continue;
-    if (typeof g.endsAt === "number" && g.endsAt <= Date.now()) {
-      await endGiveaway(g.messageId).catch(() => {});
-      recoveredEnded += 1;
-      continue;
-    }
-    scheduleGiveaway(g);
-    scheduled += 1;
-  }
-  console.log(`Giveaway recovery complete. Scheduled: ${scheduled}, ended on startup: ${recoveredEnded}, total records: ${giveaways.length}`);
-
-  for (const guild of client.guilds.cache.values()) {
-    cacheInvitesForGuild(guild).catch(() => {});
-  }
-
-  setInterval(() => {
-    runStreamChecksSafely().catch(() => {});
-  }, config.social?.checkIntervalMs || 2 * 60 * 1000);
-  runStreamChecksSafely().catch(() => {});
-
-  const antinukeCfg = currentConfig().antinuke || {};
-  setInterval(() => {
-    runMonitorLoop().catch(() => {});
-  }, Math.max(15000, antinukeCfg.realtimeMonitorIntervalMs || 45000));
-  runMonitorLoop().catch(() => {});
-
-  setInterval(() => {
-    governance.decayRiskAll(1);
-  }, 5 * 60 * 1000);
-
-  setInterval(() => {
-    runScheduledBackupsSafely();
-  }, 5 * 60 * 1000);
-  runScheduledBackupsSafely();
-
-  startRiddleLoop();
+  startupCompleted = true;
+  console.log("[startup] post-ready startup sequence finished");
 });
 
 client.on(Events.GuildMemberAdd, async member => { 
@@ -2835,9 +2901,35 @@ if (cmd === "poll") {
   }
 });
 
-client.on("error", console.error);
-process.on("unhandledRejection", console.error);
-process.on("uncaughtException", console.error);
+client.on("error", err => {
+  logRuntimeError("discord-client-error", err);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  const detail = reason instanceof Error ? `${reason.message}\n${reason.stack || ""}` : reason;
+  console.error("[runtime] unhandledRejection:", detail);
+  if (!startupCompleted) {
+    console.error("[runtime] unhandledRejection occurred during startup phase.");
+  }
+  if (promise) {
+    console.error("[runtime] unhandledRejection promise:", promise);
+  }
+});
+
+process.on("uncaughtException", err => {
+  logRuntimeError("uncaughtException", err);
+  if (!startupCompleted) {
+    console.error("[runtime] uncaughtException occurred during startup phase.");
+  }
+});
+
+process.on("SIGTERM", signal => {
+  console.warn(`[runtime] received ${signal}; process may be stopping due to platform lifecycle.`);
+});
+
+process.on("SIGINT", signal => {
+  console.warn(`[runtime] received ${signal}; shutting down signal observed.`);
+});
 
 console.log("ABOUT TO LOGIN...");
 client.login(process.env.DISCORD_TOKEN)

@@ -5,6 +5,10 @@ const { readJson, writeJson } = require("./storage");
 const streamsPath = path.join(__dirname, "../data/streams.json");
 const sentCache = new Set();
 
+function normalizePlatform(platform) {
+  return String(platform || "").trim().toLowerCase();
+}
+
 function loadStreams() {
   return readJson(streamsPath, []);
 }
@@ -94,25 +98,29 @@ async function checkTikTok(handle) {
 
     if (!finalUrl.includes("/live")) return false;
 
-    return /isLiveBroadcast/i.test(text) ||
-           /LIVE now/i.test(text) ||
-           /liveRoom/i.test(text) ||
-           /"status":2/.test(text);
+    const hasLiveBroadcastFlag = /"isLiveBroadcast"\s*:\s*true/i.test(text);
+    const hasLiveRoomWithStatus2 = /"liveRoom"\s*:\s*\{[\s\S]{0,500}?"status"\s*:\s*2\b/i.test(text);
+    const hasExplicitLiveStatus = /"liveStatus"\s*:\s*"LIVE_STATUS_LIVE"/i.test(text) ||
+      /"live_status"\s*:\s*2\b/i.test(text);
+
+    return hasLiveBroadcastFlag || hasLiveRoomWithStatus2 || hasExplicitLiveStatus;
   } catch {
     return false;
   }
 }
 
 async function bestEffortPostSeen(platform, handle) {
+  const normalizedPlatform = normalizePlatform(platform);
+
   try {
-    if (platform === "youtube") {
+    if (normalizedPlatform === "youtube") {
       const res = await fetch(`https://www.youtube.com/channel/${encodeURIComponent(handle)}/videos`);
       const text = await res.text();
       const m = text.match(/"videoId":"([^"]+)"/);
       return m ? m[1] : null;
     }
 
-    if (platform === "tiktok") {
+    if (normalizedPlatform === "tiktok") {
       const res = await fetch(`https://www.tiktok.com/@${encodeURIComponent(handle)}`, {
         headers: { "User-Agent": "Mozilla/5.0" }
       });
@@ -121,7 +129,7 @@ async function bestEffortPostSeen(platform, handle) {
       return m ? m[1] : null;
     }
 
-    if (platform === "x") {
+    if (normalizedPlatform === "x") {
       const res = await fetch(`https://x.com/${encodeURIComponent(handle)}`, {
         headers: { "User-Agent": "Mozilla/5.0" }
       });
@@ -136,47 +144,76 @@ async function bestEffortPostSeen(platform, handle) {
 
 async function checkStreams(client, config, makeEmbed) {
   const streamers = loadStreams();
+  const uniqueStreamers = [];
+  const seenStreamKeys = new Set();
 
-  for (const guild of client.guilds.cache.values()) {
-    const streamChannel = guild.channels.cache.find(c => c.name === config.channels.streams);
-    const postChannel = guild.channels.cache.find(c => c.name === config.channels.posts);
-    const role = guild.roles.cache.find(r => r.name === config.roles.streamPing);
+  for (const s of streamers) {
+    const platform = normalizePlatform(s.platform);
+    const handle = String(s.handle || "").trim();
+    const name = String(s.name || "").trim();
 
-    for (const s of streamers) {
-      let live = false;
+    if (!platform || !handle || !name) continue;
 
-      if (s.platform === "twitch") live = await checkTwitch(s.handle);
-      if (s.platform === "youtube") live = await checkYouTube(s.handle);
-      if (s.platform === "kick") live = await checkKick(s.handle);
-      if (s.platform === "tiktok") live = await checkTikTok(s.handle);
+    const dedupeKey = `${platform}:${handle.toLowerCase()}:${name.toLowerCase()}`;
+    if (seenStreamKeys.has(dedupeKey)) continue;
 
-      const liveKey = `${guild.id}:${s.name}:${s.platform}:live`;
+    seenStreamKeys.add(dedupeKey);
+    uniqueStreamers.push(s);
+  }
 
-      if (live && !sentCache.has(liveKey)) {
+  for (const s of uniqueStreamers) {
+    const platform = normalizePlatform(s.platform);
+    const wasLive = s.live === true;
+    let live = false;
+
+    if (platform === "twitch") live = await checkTwitch(s.handle);
+    if (platform === "youtube") live = await checkYouTube(s.handle);
+    if (platform === "kick") live = await checkKick(s.handle);
+    if (platform === "tiktok") live = await checkTikTok(s.handle);
+
+    if (live) {
+      s.live = true;
+      s.offlineChecks = 0;
+      if (!wasLive) s.lastLiveAt = Date.now();
+    } else {
+      const nextOfflineChecks = (Number(s.offlineChecks) || 0) + 1;
+      s.offlineChecks = nextOfflineChecks;
+      if (nextOfflineChecks >= 2) {
+        s.live = false;
+      }
+    }
+
+    const wentLive = !wasLive && live;
+    const previousPostId = s.lastPostId;
+    const latestPostId = await bestEffortPostSeen(platform, s.handle);
+    const hasNewPost = !!latestPostId && latestPostId !== previousPostId;
+    if (hasNewPost) {
+      s.lastPostId = latestPostId;
+    }
+
+    for (const guild of client.guilds.cache.values()) {
+      const streamChannel = guild.channels.cache.find(c => c.name === config.channels.streams);
+      const postChannel = guild.channels.cache.find(c => c.name === config.channels.posts);
+      const role = guild.roles.cache.find(r => r.name === config.roles.streamPing);
+      const liveKey = `${guild.id}:${s.name}:${platform}:live`;
+
+      if (wentLive && !sentCache.has(liveKey)) {
         sentCache.add(liveKey);
-        s.live = true;
-        s.lastLiveAt = Date.now();
-
         await streamChannel?.send({
           content: role ? `<@&${role.id}>` : "",
-          embeds: [makeEmbed("🔴 LIVE NOW", `${s.name} is now live on ${s.platform}!`, "success")]
+          embeds: [makeEmbed("🔴 LIVE NOW", `${s.name} is now live on ${platform}!`, "success")]
         }).catch(() => {});
       }
 
-      if (!live) {
-        s.live = false;
+      if (!s.live) {
         sentCache.delete(liveKey);
       }
 
-      const latestPostId = await bestEffortPostSeen(s.platform, s.handle);
-      const postKey = `${guild.id}:${s.name}:${s.platform}:post:${latestPostId}`;
-
-      if (latestPostId && latestPostId !== s.lastPostId && !sentCache.has(postKey)) {
-        s.lastPostId = latestPostId;
+      const postKey = `${guild.id}:${s.name}:${platform}:post:${latestPostId}`;
+      if (hasNewPost && !sentCache.has(postKey)) {
         sentCache.add(postKey);
-
         await postChannel?.send({
-          embeds: [makeEmbed("🎥 New Post", `${s.name} posted on ${s.platform}!`, "info")]
+          embeds: [makeEmbed("🎥 New Post", `${s.name} posted on ${platform}!`, "info")]
         }).catch(() => {});
       }
     }

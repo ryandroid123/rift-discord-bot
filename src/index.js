@@ -318,7 +318,8 @@ function storeAutoModHistory(key, history, item) {
   automodCache.set(key, history);
 }
 
-function detectAutoModTrigger(message, settings) {
+function detectAutoModTrigger(message, settings, options = {}) {
+  const shouldRecordHistory = options.recordHistory !== false;
   const content = message.content || "";
   const minAggressiveLen = config.automod?.minMessageLengthForAggressiveChecks ?? 6;
   const aggressiveEligible = content.length >= minAggressiveLen;
@@ -335,14 +336,16 @@ function detectAutoModTrigger(message, settings) {
   const bypassCaps = hasAnyRole(message.member, settings.capsBypassRoles || []);
   const { key, history, now } = getAutoModHistory(message, settings);
 
-  const historyItem = {
-    time: now,
-    text: content,
-    normalized,
-    links,
-    attachments
-  };
-  storeAutoModHistory(key, history, historyItem);
+  if (shouldRecordHistory) {
+    const historyItem = {
+      time: now,
+      text: content,
+      normalized,
+      links,
+      attachments
+    };
+    storeAutoModHistory(key, history, historyItem);
+  }
 
   const isInviteLink = settings.antiInvite && links.some(link =>
     /discord(?:app)?\.com\/invite\/|discord\.gg\//i.test(link)
@@ -741,6 +744,26 @@ function isTrustedAntiNukeActor(guild, member, settings) {
   return false;
 }
 
+function getProtectionImmunity(member, guild, settings = null) {
+  if (!member) {
+    return { immune: true, reason: "missing-member" };
+  }
+
+  if (hasAnyRole(member, ["Founder"])) {
+    return { immune: true, reason: "founder-role" };
+  }
+
+  if (guild && member.id === guild.ownerId) {
+    return { immune: true, reason: "guild-owner" };
+  }
+
+  if (settings && settings.trustedUserIds?.includes(member.id)) {
+    return { immune: true, reason: "trusted-user" };
+  }
+
+  return { immune: false, reason: null };
+}
+
 function getDangerousPermissionFlags() {
   return [
     PermissionsBitField.Flags.Administrator,
@@ -805,6 +828,14 @@ async function antiNukeCheck(guild, executorId, action, extra = {}) {
   const settings = getAntiNukeSettings();
   const member = await guild.members.fetch(executorId).catch(() => null);
   if (!member) return;
+  const immunity = getProtectionImmunity(member, guild, settings);
+  if (immunity.immune) {
+    await sendTypedLog(guild, "security", "Anti-Nuke Ignored (Immune)", `${member.user.tag} triggered ${action}, but no action was taken due to immunity.`, "info", [
+      { name: "Reason", value: immunity.reason, inline: true },
+      { name: "Target", value: extra.target || "n/a", inline: true }
+    ]);
+    return;
+  }
   if (isTrustedAntiNukeActor(guild, member, settings)) return;
   if (!hasStaffRole(member) && !member.permissions.has(PermissionFlagsBits.ManageGuild)) return;
 
@@ -874,6 +905,13 @@ async function checkJoinRaid(member) {
   const antiRaid = config.automod?.antiRaid || {};
   const enabled = antiRaid.enabled !== false;
   if (!enabled) return;
+  const immunity = getProtectionImmunity(member, member.guild);
+  if (immunity.immune) {
+    await sendTypedLog(member.guild, "security", "Anti-Raid Ignored (Immune)", `${member.user.tag} join event ignored by anti-raid due to immunity.`, "info", [
+      { name: "Reason", value: immunity.reason, inline: true }
+    ]);
+    return;
+  }
 
   const windowMs = antiRaid.windowMs ?? 15000;
   const joinLimit = antiRaid.joinLimit ?? 8;
@@ -1165,6 +1203,17 @@ client.on(Events.MessageCreate, async message => {
   });
 
   const settings = getAutoModSettings();
+  const immunity = getProtectionImmunity(message.member, message.guild);
+  if (immunity.immune) {
+    const ignoredTrigger = detectAutoModTrigger(message, settings, { recordHistory: false });
+    if (ignoredTrigger) {
+      await sendTypedLog(message.guild, "moderation", "AutoMod Ignored (Immune)", `${message.author.tag} matched rule ${ignoredTrigger.rule}, but no action was taken due to immunity.`, "info", [
+        { name: "Reason", value: immunity.reason, inline: true },
+        { name: "Evidence", value: (ignoredTrigger.evidence || "n/a").slice(0, 1000) }
+      ]);
+    }
+    return;
+  }
   if (isAutoModBypassed(message, settings)) return;
 
   const trigger = detectAutoModTrigger(message, settings);

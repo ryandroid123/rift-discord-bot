@@ -228,7 +228,12 @@ module.exports = [
     description: "Create a giveaway in the current channel.",
     options: [
       { name: "duration", type: 3, required: true, description: "10m, 1h, 1d" },
-      { name: "prize", type: 3, required: true, description: "Prize" }
+      { name: "prize", type: 3, required: true, description: "Prize" },
+      { name: "winners", type: 4, required: false, description: "Number of winners" },
+      { name: "required_role", type: 8, required: false, description: "Role required to join" },
+      { name: "blacklist_role", type: 8, required: false, description: "Role blocked from joining" },
+      { name: "bonus_role", type: 8, required: false, description: "Role with bonus entries" },
+      { name: "bonus_entries", type: 4, required: false, description: "Bonus entries for bonus role" }
     ]
   },
   {
@@ -250,7 +255,11 @@ module.exports = [
     { name: "answer1", type: 3, required: true, description: "First answer" },
     { name: "answer2", type: 3, required: true, description: "Second answer" },
     { name: "answer3", type: 3, required: false, description: "Third answer" },
-    { name: "answer4", type: 3, required: false, description: "Fourth answer" }
+    { name: "answer4", type: 3, required: false, description: "Fourth answer" },
+    { name: "answer5", type: 3, required: false, description: "Fifth answer" },
+    { name: "answer6", type: 3, required: false, description: "Sixth answer" },
+    { name: "duration", type: 3, required: false, description: "Auto-end duration (10m, 1h)" },
+    { name: "anonymous", type: 5, required: false, description: "Hide creator in poll embed" }
   ]
 },
   {
@@ -274,7 +283,10 @@ module.exports = [
   {
     name: "suggest",
     description: "Post a suggestion.",
-    options: [{ name: "idea", type: 3, required: true, description: "Your suggestion" }]
+    options: [
+      { name: "idea", type: 3, required: true, description: "Your suggestion" },
+      { name: "anonymous", type: 5, required: false, description: "Post anonymously" }
+    ]
   },
   { name: "riddle", description: "Post a random riddle." },
   {
@@ -297,5 +309,462 @@ module.exports = [
     description: "Set your AFK status.",
     options: [{ name: "reason", type: 3, required: false, description: "Reason" }]
   },
-  { name: "snipe", description: "Show the last deleted message in this channel." }
+  { name: "snipe", description: "Show the last deleted message in this channel." },
+  {
+    name: "giveawaymanage",
+    description: "Manage giveaway state.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "end/info",
+        choices: [
+          { name: "end", value: "end" },
+          { name: "info", value: "info" }
+        ]
+      },
+      { name: "messageid", type: 3, required: true, description: "Giveaway message ID" }
+    ]
+  },
+  {
+    name: "ticket",
+    description: "Ticket management actions.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "claim/close/note/transcriptsearch",
+        choices: [
+          { name: "claim", value: "claim" },
+          { name: "close", value: "close" },
+          { name: "note", value: "note" },
+          { name: "transcriptsearch", value: "transcriptsearch" }
+        ]
+      },
+      { name: "reason", type: 3, required: false, description: "Close reason, note, or search text" }
+    ]
+  },
+  {
+    name: "welcome",
+    description: "Welcome and leave message settings.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "set/dm/autorole/image/leave/show",
+        choices: [
+          { name: "set", value: "set" },
+          { name: "dm", value: "dm" },
+          { name: "autorole", value: "autorole" },
+          { name: "image", value: "image" },
+          { name: "leave", value: "leave" },
+          { name: "show", value: "show" }
+        ]
+      },
+      { name: "text", type: 3, required: false, description: "Template text or image URL" },
+      { name: "role", type: 8, required: false, description: "Auto-role for joins" }
+    ]
+  },
+  {
+    name: "level",
+    description: "Leveling controls and stats.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "rank/leaderboard/toggle/reward",
+        choices: [
+          { name: "rank", value: "rank" },
+          { name: "leaderboard", value: "leaderboard" },
+          { name: "toggle", value: "toggle" },
+          { name: "reward", value: "reward" }
+        ]
+      },
+      { name: "enabled", type: 5, required: false, description: "Enable leveling (toggle)" },
+      { name: "level", type: 4, required: false, description: "Level threshold (reward)" },
+      { name: "role", type: 8, required: false, description: "Reward role (reward)" },
+      { name: "user", type: 6, required: false, description: "Target user for rank" }
+    ]
+  },
+  {
+    name: "economy",
+    description: "Server currency commands.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "balance/grant/take/pay",
+        choices: [
+          { name: "balance", value: "balance" },
+          { name: "grant", value: "grant" },
+          { name: "take", value: "take" },
+          { name: "pay", value: "pay" }
+        ]
+      },
+      { name: "user", type: 6, required: false, description: "Target user" },
+      { name: "amount", type: 4, required: false, description: "Amount" }
+    ]
+  },
+  {
+    name: "suggestion",
+    description: "Suggestion review and response.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "approve/deny/respond",
+        choices: [
+          { name: "approve", value: "approve" },
+          { name: "deny", value: "deny" },
+          { name: "respond", value: "respond" }
+        ]
+      },
+      { name: "messageid", type: 3, required: true, description: "Suggestion message ID" },
+      { name: "text", type: 3, required: false, description: "Reason or response text" }
+    ]
+  },
+  {
+    name: "application",
+    description: "Application system actions.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "submit/review/list",
+        choices: [
+          { name: "submit", value: "submit" },
+          { name: "review", value: "review" },
+          { name: "list", value: "list" }
+        ]
+      },
+      { name: "type", type: 3, required: false, description: "staff/creator/partnership" },
+      { name: "answers", type: 3, required: false, description: "Structured answers text" },
+      { name: "id", type: 3, required: false, description: "Application ID for review" },
+      { name: "status", type: 3, required: false, description: "approved/denied/pending" },
+      { name: "note", type: 3, required: false, description: "Review note" }
+    ]
+  },
+  {
+    name: "partnership",
+    description: "Partnership manager.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "template/post/bump",
+        choices: [
+          { name: "template", value: "template" },
+          { name: "post", value: "post" },
+          { name: "bump", value: "bump" }
+        ]
+      },
+      { name: "server", type: 3, required: false, description: "Partner server name" },
+      { name: "invite", type: 3, required: false, description: "Invite URL" }
+    ]
+  },
+  {
+    name: "mediaonly",
+    description: "Manage media-only channels.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "add/remove/list",
+        choices: [
+          { name: "add", value: "add" },
+          { name: "remove", value: "remove" },
+          { name: "list", value: "list" }
+        ]
+      },
+      { name: "channel", type: 7, required: false, description: "Target channel" }
+    ]
+  },
+  {
+    name: "sticky",
+    description: "Manage sticky messages.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "set/clear",
+        choices: [
+          { name: "set", value: "set" },
+          { name: "clear", value: "clear" }
+        ]
+      },
+      { name: "text", type: 3, required: false, description: "Sticky text" },
+      { name: "cooldown_seconds", type: 4, required: false, description: "Repost cooldown" }
+    ]
+  },
+  {
+    name: "starboard",
+    description: "Configure starboard.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "set/off",
+        choices: [
+          { name: "set", value: "set" },
+          { name: "off", value: "off" }
+        ]
+      },
+      { name: "channel", type: 7, required: false, description: "Starboard channel" },
+      { name: "emoji", type: 3, required: false, description: "Emoji (default ⭐)" },
+      { name: "threshold", type: 4, required: false, description: "Minimum reactions" }
+    ]
+  },
+  {
+    name: "remind",
+    description: "Create a reminder.",
+    options: [
+      { name: "time", type: 3, required: true, description: "10m, 2h, 1d" },
+      { name: "text", type: 3, required: true, description: "Reminder text" }
+    ]
+  },
+  {
+    name: "countdown",
+    description: "Countdown and event reminders.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "create/list",
+        choices: [
+          { name: "create", value: "create" },
+          { name: "list", value: "list" }
+        ]
+      },
+      { name: "name", type: 3, required: false, description: "Event name" },
+      { name: "time", type: 3, required: false, description: "When it ends (10m, 2h, 1d)" }
+    ]
+  },
+  {
+    name: "rolemenu",
+    description: "Create button role menus.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "create",
+        choices: [
+          { name: "create", value: "create" }
+        ]
+      },
+      { name: "title", type: 3, required: true, description: "Menu title" },
+      { name: "role1", type: 8, required: true, description: "Role 1" },
+      { name: "role2", type: 8, required: false, description: "Role 2" },
+      { name: "role3", type: 8, required: false, description: "Role 3" }
+    ]
+  },
+  {
+    name: "embedbuilder",
+    description: "Build and post a custom embed.",
+    options: [
+      { name: "title", type: 3, required: true, description: "Embed title" },
+      { name: "description", type: 3, required: true, description: "Embed description" },
+      { name: "footer", type: 3, required: false, description: "Footer text" },
+      { name: "color", type: 3, required: false, description: "Hex color (#00AAFF)" },
+      { name: "field1", type: 3, required: false, description: "Field format: Name|Value" }
+    ]
+  },
+  {
+    name: "nick",
+    description: "Nickname moderation controls.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "set/reset/rule",
+        choices: [
+          { name: "set", value: "set" },
+          { name: "reset", value: "reset" },
+          { name: "rule", value: "rule" }
+        ]
+      },
+      { name: "user", type: 6, required: false, description: "Target user" },
+      { name: "value", type: 3, required: false, description: "Nickname or rule regex" }
+    ]
+  },
+  {
+    name: "quote",
+    description: "Save and fetch quotes.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "save/random/list",
+        choices: [
+          { name: "save", value: "save" },
+          { name: "random", value: "random" },
+          { name: "list", value: "list" }
+        ]
+      },
+      { name: "messageid", type: 3, required: false, description: "Message ID to save" }
+    ]
+  },
+  {
+    name: "tag",
+    description: "Custom tag manager.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "create/edit/delete/use/list",
+        choices: [
+          { name: "create", value: "create" },
+          { name: "edit", value: "edit" },
+          { name: "delete", value: "delete" },
+          { name: "use", value: "use" },
+          { name: "list", value: "list" }
+        ]
+      },
+      { name: "name", type: 3, required: false, description: "Tag name" },
+      { name: "content", type: 3, required: false, description: "Tag content" }
+    ]
+  },
+  {
+    name: "birthday",
+    description: "Birthday tracker.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "set/list",
+        choices: [
+          { name: "set", value: "set" },
+          { name: "list", value: "list" }
+        ]
+      },
+      { name: "date", type: 3, required: false, description: "MM-DD" }
+    ]
+  },
+  {
+    name: "serverstatus",
+    description: "Show protection, backup, and health status."
+  },
+  {
+    name: "auditdashboard",
+    description: "Show recent punishments and bot actions."
+  },
+  {
+    name: "commandcontrol",
+    description: "Enable or disable commands by channel or role.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "disable/enable/status",
+        choices: [
+          { name: "disable", value: "disable" },
+          { name: "enable", value: "enable" },
+          { name: "status", value: "status" }
+        ]
+      },
+      { name: "command", type: 3, required: false, description: "Command name" },
+      { name: "channel", type: 7, required: false, description: "Restrict channel" },
+      { name: "role", type: 8, required: false, description: "Restrict role" }
+    ]
+  },
+  {
+    name: "maintenance",
+    description: "Toggle maintenance mode.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "on/off",
+        choices: [
+          { name: "on", value: "on" },
+          { name: "off", value: "off" }
+        ]
+      },
+      { name: "reason", type: 3, required: false, description: "Maintenance reason" }
+    ]
+  },
+  {
+    name: "help",
+    description: "Improved help command with search.",
+    options: [{ name: "search", type: 3, required: false, description: "Search command name" }]
+  },
+  {
+    name: "onboarding",
+    description: "Set onboarding prompts.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "set/show",
+        choices: [
+          { name: "set", value: "set" },
+          { name: "show", value: "show" }
+        ]
+      },
+      { name: "text", type: 3, required: false, description: "Prompt text" }
+    ]
+  },
+  {
+    name: "form",
+    description: "Custom forms for staff workflows.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "create/submit/list",
+        choices: [
+          { name: "create", value: "create" },
+          { name: "submit", value: "submit" },
+          { name: "list", value: "list" }
+        ]
+      },
+      { name: "name", type: 3, required: false, description: "Form name" },
+      { name: "schema", type: 3, required: false, description: "Question list or submission text" }
+    ]
+  },
+  {
+    name: "reportanon",
+    description: "Submit an anonymous report.",
+    options: [{ name: "text", type: 3, required: true, description: "Report details" }]
+  },
+  {
+    name: "schedule",
+    description: "Scheduled announcements and recurring posts.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "create/list/delete",
+        choices: [
+          { name: "create", value: "create" },
+          { name: "list", value: "list" },
+          { name: "delete", value: "delete" }
+        ]
+      },
+      { name: "id", type: 3, required: false, description: "Schedule ID (delete)" },
+      { name: "interval", type: 3, required: false, description: "10m, 1h, 1d (create)" },
+      { name: "text", type: 3, required: false, description: "Announcement text (create)" }
+    ]
+  }
 ];

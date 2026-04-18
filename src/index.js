@@ -48,6 +48,7 @@ const {
 const { checkStreams, loadStreams, saveStreams, checkTwitch, checkYouTube, checkKick, checkTikTok } = require("./utils/socials");
 const { createGuildBackupSnapshot, restoreGuildBackupSnapshot } = require("./utils/backup");
 const governance = require("./utils/governance");
+const featureHub = require("./utils/feature-hub");
 
 const client = new Client({
   intents: [
@@ -906,6 +907,26 @@ function canUseModCommand(member) {
   return hasAnyRole(member, ["Founder", "Admin", "Moderator"]);
 }
 
+function featureContext() {
+  return {
+    commands,
+    makeEmbed,
+    governance,
+    canUseModCommand,
+    currentConfig,
+    getChannelByName,
+    sendLog,
+    sendTypedLog,
+    isTicketChannel,
+    loadGiveaways,
+    saveGiveaways,
+    scheduleGiveaway,
+    endGiveaway,
+    loadBackups,
+    sendTranscript
+  };
+}
+
 async function sendLog(guild, title, description, type = "info", fields = []) {
   const ch = getLogChannelByType(guild, "general");
   if (!ch) return;
@@ -1091,9 +1112,27 @@ async function endGiveaway(messageId) {
 
   let winnerText = "No one entered.";
   if (giveaway.entries.length) {
-    const winnerId = giveaway.entries[Math.floor(Math.random() * giveaway.entries.length)];
-    giveaway.winnerId = winnerId;
-    winnerText = `<@${winnerId}>`;
+    const weighted = [];
+    for (const userId of giveaway.entries) {
+      let weight = 1;
+      const member = guild.members.cache.get(userId);
+      for (const bonus of giveaway.bonusEntries || []) {
+        if (member?.roles?.cache?.has(bonus.roleId)) {
+          weight += Math.max(0, Number(bonus.entries) || 0);
+        }
+      }
+      for (let i = 0; i < weight; i += 1) weighted.push(userId);
+    }
+    const winnersWanted = Math.max(1, Number(giveaway.winners) || 1);
+    const unique = new Set();
+    for (let i = 0; i < weighted.length && unique.size < winnersWanted; i += 1) {
+      const idx = Math.floor(Math.random() * weighted.length);
+      unique.add(weighted[idx]);
+    }
+    const winners = [...unique];
+    giveaway.winnerId = winners[0] || null;
+    giveaway.winnerIds = winners;
+    winnerText = winners.map(id => `<@${id}>`).join(", ");
   }
 
   saveGiveaways(giveaways);
@@ -1112,7 +1151,8 @@ async function endGiveaway(messageId) {
 
   await sendLog(guild, "Giveaway Ended", `Giveaway ended in ${channel}.`, "info", [
     { name: "Prize", value: giveaway.prize, inline: true },
-    { name: "Winner", value: winnerText, inline: true }
+    { name: "Winner(s)", value: winnerText, inline: true },
+    { name: "Entries", value: String(giveaway.entries.length), inline: true }
   ]);
 }
 
@@ -1675,6 +1715,10 @@ client.once(Events.ClientReady, async () => {
     await runStartupTask("start riddle loop", async () => {
       startRiddleLoop();
     });
+
+    await runStartupTask("start feature scheduler loop", async () => {
+      await featureHub.onReady(client, featureContext());
+    });
   } catch (err) {
     logRuntimeError("[startup] unexpected failure in startup sequence", err);
   }
@@ -1728,28 +1772,7 @@ client.on(Events.GuildMemberAdd, async member => {
     { name: "Invited By", value: inviterText }
   ]);
 
-  const landing = getChannelByName(member.guild, config.channels.landing);
-  if (landing) {
-    await landing.send({
-      embeds: [
-        makeEmbed(
-          "Welcome to Rift Studios",
-          `Welcome ${member} to **${member.guild.name}**.\n\nThank you for joining **.gg/riftstudios**!\nStay tuned for the game's release 👀`,
-          "success"
-        )
-      ]
-    }).catch(() => {});
-  }
-
-  await member.send({
-    embeds: [
-      makeEmbed(
-        "Welcome to Rift Studios",
-        "Thank you for joining **.gg/riftstudios**!\n\nStay tuned for the game's release 👀",
-        "success"
-      )
-    ]
-  }).catch(() => {});
+  await featureHub.handleMemberAdd(member, featureContext()).catch(err => logRuntimeError("feature-member-add", err));
 });
 
 client.on(Events.GuildMemberRemove, async member => {
@@ -1763,22 +1786,12 @@ client.on(Events.GuildMemberRemove, async member => {
     await sendTypedLog(member.guild, "member", "Member Left", `${member.user.tag} left the server.`, "warn");
   }
 
-  const takeoff = getChannelByName(member.guild, config.channels.takeoff);
-  if (takeoff) {
-    await takeoff.send({
-      embeds: [
-        makeEmbed(
-          "Member Left",
-          `**${member.user.tag}** has left **${member.guild.name}**.`,
-          "warn"
-        )
-      ]
-    }).catch(() => {});
-  }
+  await featureHub.handleMemberRemove(member, featureContext()).catch(err => logRuntimeError("feature-member-remove", err));
 });
 
 client.on(Events.MessageDelete, async message => {
   if (!message.guild || !message.author || message.author.bot) return;
+  await featureHub.handleMessageDelete(message, featureContext()).catch(err => logRuntimeError("feature-message-delete", err));
   const snipes = loadSnipes();
   snipes[message.channel.id] = {
     content: message.content || "[embed/attachment]",
@@ -1806,25 +1819,21 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
   ]);
 });
 
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  await featureHub.handleReactionAdd(reaction, user, featureContext()).catch(err => logRuntimeError("feature-reaction-add", err));
+});
+
 client.on(Events.MessageCreate, async message => {
   if (!message.guild || message.author.bot) return;
   if (Date.now() - message.createdTimestamp > 15000) return;
   if (!message.content && !message.attachments?.size) return;
   governance.incrementAnalytics(message.guild.id, "messagesSeen", 1);
 
-  const afk = getAFKStateCached();
-  if (afk[message.author.id]) {
-    updateAFKStateAndPersist(current => {
-      delete current[message.author.id];
-    });
-    runDetached("afk-return-reply", () => message.reply("Welcome back, AFK removed.").catch(() => {}));
-  }
-
-  message.mentions.users.forEach(user => {
-    if (afk[user.id]) {
-      runDetached("afk-mention-reply", () => message.reply(`${user.tag} is AFK: ${afk[user.id]}`).catch(() => {}));
-    }
+  const featureResult = await featureHub.handleMessageCreate(message, featureContext()).catch(err => {
+    logRuntimeError("feature-message-create", err);
+    return { stop: false };
   });
+  if (featureResult?.stop) return;
 
   const settings = getAutoModSettings();
   const immunity = getProtectionImmunity(message.member, message.guild);
@@ -2009,6 +2018,10 @@ client.on(Events.InteractionCreate, async interaction => {
           embeds: [makeEmbed("All Commands", commands.map(c => `/${c.name}`).join("\n"), "info")],
           ephemeral: true
         });
+        return;
+      }
+
+      if (await featureHub.handleCommand(interaction, featureContext())) {
         return;
       }
 
@@ -2929,6 +2942,10 @@ if (cmd === "poll") {
     }
 
     if (interaction.isButton()) {
+      if (await featureHub.handleButton(interaction, featureContext())) {
+        return;
+      }
+
       if (interaction.customId === "open_support_ticket") {
         const result = await createTicket(interaction.guild, interaction.user, "support");
 
@@ -3025,6 +3042,12 @@ if (cmd === "poll") {
       }
     }
 
+    if (interaction.isModalSubmit()) {
+      if (await featureHub.handleModal(interaction, featureContext())) {
+        return;
+      }
+    }
+
     if (interaction.isModalSubmit() && interaction.customId === "staff_application_modal") {
       const result = await createTicket(interaction.guild, interaction.user, "application", {
         age: interaction.fields.getTextInputValue("age"),
@@ -3083,3 +3106,4 @@ console.log("ABOUT TO LOGIN...");
 client.login(process.env.DISCORD_TOKEN)
   .then(() => console.log("LOGIN CALLED"))
   .catch(err => console.error("LOGIN ERROR:", err));
+

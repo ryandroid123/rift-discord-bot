@@ -1089,13 +1089,65 @@ async function ensureRulesMessage(guild) {
 
 function loadInviteCountsFromState() {
   const s = state();
-  return new Map(s.inviteCounts || []);
+  const out = new Map();
+  for (const [key, value] of (s.inviteCounts || [])) {
+    out.set(String(key), Number(value) || 0);
+  }
+  return out;
 }
 
 function saveInviteCountsToState(map) {
   const s = state();
   s.inviteCounts = [...map.entries()];
   saveState(s);
+}
+
+function incrementInviteStat(guildId, inviterId, amount = 1) {
+  if (!guildId || !inviterId) return;
+  const key = `${guildId}:${inviterId}`;
+  const next = (Number(memberInviteStats.get(key)) || 0) + Math.max(0, Number(amount) || 0);
+  memberInviteStats.set(key, next);
+  saveInviteCountsToState(memberInviteStats);
+}
+
+async function syncInviteStatsFromGuild(guild, options = {}) {
+  const invites = await guild.invites.fetch().catch(() => null);
+  if (!invites) return false;
+
+  const overwrite = options.overwrite === true;
+  const perUser = new Map();
+  for (const inv of invites.values()) {
+    const inviterId = inv.inviter?.id;
+    if (!inviterId) continue;
+    const uses = Number(inv.uses || 0);
+    perUser.set(inviterId, (perUser.get(inviterId) || 0) + uses);
+  }
+
+  let changed = false;
+  for (const [inviterId, uses] of perUser.entries()) {
+    const key = `${guild.id}:${inviterId}`;
+    const current = Number(memberInviteStats.get(key)) || 0;
+    const next = overwrite ? uses : Math.max(current, uses);
+    if (next !== current) {
+      memberInviteStats.set(key, next);
+      changed = true;
+    }
+  }
+  if (changed) saveInviteCountsToState(memberInviteStats);
+  inviteCache.set(guild.id, new Map(invites.map(inv => [inv.code, Number(inv.uses || 0)])));
+  return true;
+}
+
+function buildInviteLeaderboard(guildId, limit = 10) {
+  const rows = [];
+  const prefix = `${guildId}:`;
+  for (const [key, value] of memberInviteStats.entries()) {
+    if (!String(key).startsWith(prefix)) continue;
+    const inviterId = String(key).slice(prefix.length);
+    rows.push({ inviterId, count: Number(value) || 0 });
+  }
+  rows.sort((a, b) => b.count - a.count);
+  return rows.slice(0, Math.max(1, Math.min(25, limit)));
 }
 
 async function endGiveaway(messageId) {
@@ -1419,9 +1471,7 @@ async function antiNukeCheck(guild, executorId, action, extra = {}) {
 }
 
 async function cacheInvitesForGuild(guild) {
-  const invites = await guild.invites.fetch().catch(() => null);
-  if (!invites) return;
-  inviteCache.set(guild.id, new Map(invites.map(inv => [inv.code, inv.uses || 0])));
+  await syncInviteStatsFromGuild(guild, { overwrite: false }).catch(() => {});
 }
 
 async function checkJoinRaid(member) {
@@ -1755,17 +1805,33 @@ client.on(Events.GuildMemberAdd, async member => {
   const newInvites = await member.guild.invites.fetch().catch(() => null);
 
   if (newInvites) {
-    const used = newInvites.find(inv => (inv.uses || 0) > (oldMap.get(inv.code) || 0));
+    const changed = [];
+    for (const inv of newInvites.values()) {
+      const before = Number(oldMap.get(inv.code) || 0);
+      const after = Number(inv.uses || 0);
+      if (after > before) {
+        changed.push({
+          invite: inv,
+          delta: after - before
+        });
+      }
+    }
+
+    changed.sort((a, b) => b.delta - a.delta);
+    const used = changed[0]?.invite || null;
+    const usedDelta = changed[0]?.delta || 0;
+
     if (used?.inviter) {
       inviterText = `${used.inviter.tag} (${used.code})`;
       inviterId = used.inviter.id;
-
-      const key = `${member.guild.id}:${inviterId}`;
-      memberInviteStats.set(key, (memberInviteStats.get(key) || 0) + 1);
-      saveInviteCountsToState(memberInviteStats);
+      incrementInviteStat(member.guild.id, inviterId, Math.max(1, usedDelta));
+    } else {
+      await syncInviteStatsFromGuild(member.guild, { overwrite: false }).catch(() => {});
     }
 
     inviteCache.set(member.guild.id, new Map(newInvites.map(inv => [inv.code, inv.uses || 0])));
+  } else {
+    await syncInviteStatsFromGuild(member.guild, { overwrite: false }).catch(() => {});
   }
 
   await sendTypedLog(member.guild, "member", "Member Joined", `${member.user.tag} joined and received the ${config.autoRole} role.`, "success", [
@@ -1787,6 +1853,24 @@ client.on(Events.GuildMemberRemove, async member => {
   }
 
   await featureHub.handleMemberRemove(member, featureContext()).catch(err => logRuntimeError("feature-member-remove", err));
+});
+
+client.on(Events.InviteCreate, async invite => {
+  if (!invite?.guild || !invite?.code) return;
+  const guildMap = inviteCache.get(invite.guild.id) || new Map();
+  guildMap.set(invite.code, Number(invite.uses || 0));
+  inviteCache.set(invite.guild.id, guildMap);
+});
+
+client.on(Events.InviteDelete, async invite => {
+  if (!invite?.guild || !invite?.code) return;
+  const guildMap = inviteCache.get(invite.guild.id) || new Map();
+  guildMap.delete(invite.code);
+  inviteCache.set(invite.guild.id, guildMap);
+});
+
+client.on(Events.GuildCreate, async guild => {
+  await cacheInvitesForGuild(guild).catch(err => logRuntimeError(`cache-invites-guild-create ${guild.id}`, err));
 });
 
 client.on(Events.MessageDelete, async message => {
@@ -2267,12 +2351,26 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "invites") {
+        await syncInviteStatsFromGuild(interaction.guild, { overwrite: false }).catch(() => {});
         const user = interaction.options.getUser("user") || interaction.user;
         const key = `${interaction.guild.id}:${user.id}`;
-        const count = memberInviteStats.get(key) || 0;
+        const count = Number(memberInviteStats.get(key)) || 0;
 
         await interaction.reply({
           embeds: [makeEmbed("Invite Count", `**${user.tag}** has **${count}** tracked invite${count === 1 ? "" : "s"}.`, "info")]
+        });
+        return;
+      }
+
+      if (cmd === "inviteleaderboard") {
+        await syncInviteStatsFromGuild(interaction.guild, { overwrite: false }).catch(() => {});
+        const top = buildInviteLeaderboard(interaction.guild.id, 10);
+        const text = top.length
+          ? top.map((row, idx) => `**#${idx + 1}** <@${row.inviterId}> - **${row.count}** invite${row.count === 1 ? "" : "s"}`).join("\n")
+          : "No invite data yet.";
+
+        await interaction.reply({
+          embeds: [makeEmbed("Invite Leaderboard", text, "info")]
         });
         return;
       }

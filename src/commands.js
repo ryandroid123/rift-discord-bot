@@ -70,6 +70,10 @@ module.exports = [
     options: [{ name: "user", type: 6, required: false, description: "User" }]
   },
   {
+    name: "inviteleaderboard",
+    description: "Show the top inviters in this server."
+  },
+  {
     name: "case",
     description: "View a moderation case by case ID.",
     options: [{ name: "caseid", type: 3, required: true, description: "Case ID" }]

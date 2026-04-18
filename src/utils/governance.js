@@ -25,6 +25,9 @@ ensureDataFile("scheduler.json", {});
 
 let runtimeConfigCache = null;
 let runtimeConfigLoadedAt = 0;
+let analyticsCache = null;
+const analyticsDirtyGuilds = new Set();
+let analyticsFlushTimer = null;
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -218,16 +221,25 @@ function decayRiskAll(step = 1) {
 }
 
 function incrementAnalytics(guildId, key, amount = 1) {
-  const data = readJson(analyticsPath, {});
-  if (!data[guildId]) data[guildId] = {};
-  data[guildId][key] = (Number(data[guildId][key]) || 0) + amount;
-  data[guildId].updatedAt = Date.now();
-  writeJson(analyticsPath, data);
+  if (!analyticsCache) analyticsCache = readJson(analyticsPath, {});
+  if (!analyticsCache[guildId]) analyticsCache[guildId] = {};
+  analyticsCache[guildId][key] = (Number(analyticsCache[guildId][key]) || 0) + amount;
+  analyticsCache[guildId].updatedAt = Date.now();
+  analyticsDirtyGuilds.add(guildId);
+
+  if (analyticsFlushTimer) return;
+  analyticsFlushTimer = setTimeout(() => {
+    analyticsFlushTimer = null;
+    if (!analyticsDirtyGuilds.size || !analyticsCache) return;
+    writeJson(analyticsPath, analyticsCache);
+    analyticsDirtyGuilds.clear();
+  }, 1500);
+  if (typeof analyticsFlushTimer.unref === "function") analyticsFlushTimer.unref();
 }
 
 function getAnalytics(guildId) {
-  const data = readJson(analyticsPath, {});
-  return data[guildId] || {};
+  if (!analyticsCache) analyticsCache = readJson(analyticsPath, {});
+  return analyticsCache[guildId] || {};
 }
 
 function getLockdownState(guildId) {

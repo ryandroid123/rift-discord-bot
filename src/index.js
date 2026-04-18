@@ -93,6 +93,8 @@ const logQueueByChannel = new Map();
 const streamCheckState = { running: false };
 const antiNukeDedupe = new Map();
 const coordinatedSpamCache = new Map();
+const autoModActionDedupe = new Map();
+let afkCache = null;
 let startupCompleted = false;
 
 function logRuntimeError(label, error) {
@@ -130,6 +132,14 @@ function runIntervalSafely(name, fn) {
   } catch (err) {
     logRuntimeError(`[interval] ${name}`, err);
   }
+}
+
+function runDetached(label, fn) {
+  setImmediate(() => {
+    Promise.resolve()
+      .then(fn)
+      .catch(err => logRuntimeError(label, err));
+  });
 }
 
 function logChannel(guild) {
@@ -185,6 +195,17 @@ function loadAFK() {
 
 function saveAFK(data) {
   writeJson(afkPath, data);
+}
+
+function getAFKStateCached() {
+  if (!afkCache) afkCache = loadAFK();
+  return afkCache;
+}
+
+function updateAFKStateAndPersist(mutator) {
+  const current = getAFKStateCached();
+  mutator(current);
+  saveAFK(current);
 }
 
 function loadSnipes() {
@@ -410,6 +431,8 @@ function getAutoModSettings() {
     allowBan: automod.allowBan === true,
     antiInvite: automod.antiInvite !== false,
     antiPhishing: automod.antiPhishing !== false,
+    punishmentCooldownMs: Math.min(10 * 60 * 1000, Math.max(5 * 60 * 1000, automod.punishmentCooldownMs ?? 7 * 60 * 1000)),
+    actionDedupeMs: Math.max(1000, automod.actionDedupeMs ?? 4000),
     adaptive: automod.adaptive || { enabled: false, maxRiskTightening: 0 },
     context: automod.context || { safeChannels: [], strictChannels: [] },
     escalationLadder: automod.escalationLadder || []
@@ -422,7 +445,10 @@ function getAntiNukeSettings() {
     threshold: antinuke.threshold ?? 3,
     windowMs: antinuke.windowMs ?? 30000,
     punishmentTimeoutMs: antinuke.punishmentTimeoutMs ?? 7 * 24 * 60 * 60 * 1000,
+    punishmentCooldownMs: Math.max(30 * 1000, antinuke.punishmentCooldownMs ?? 8 * 60 * 1000),
+    actionDedupeMs: Math.max(1000, antinuke.actionDedupeMs ?? 2500),
     trustedUserIds: antinuke.trustedUserIds || [],
+    protectedRoles: antinuke.protectedRoles || [],
     actionThresholds: antinuke.actionThresholds || {},
     emergency: {
       stripDangerousPermissions: antinuke.emergency?.stripDangerousPermissions !== false,
@@ -687,12 +713,63 @@ function detectAutoModTrigger(message, settings, options = {}) {
   return null;
 }
 
+function shouldSkipAutoModDuplicate(guildId, userId, action, rule, settings) {
+  const key = `${guildId}:${userId}:${action}:${rule}`;
+  const now = Date.now();
+  const last = autoModActionDedupe.get(key) || 0;
+  autoModActionDedupe.set(key, now);
+
+  const dedupeWindowMs = settings.actionDedupeMs;
+  for (const [k, t] of autoModActionDedupe.entries()) {
+    if (now - t > Math.max(30000, dedupeWindowMs * 4)) autoModActionDedupe.delete(k);
+  }
+
+  return now - last < dedupeWindowMs;
+}
+
 async function applyAutoModAction(message, trigger) {
   const settings = getAutoModSettings();
   const member = message.member;
   if (!member) return false;
 
-  await message.delete().catch(() => {});
+  const now = Date.now();
+  const state = loadAutomodState();
+  if (!state[message.guild.id]) state[message.guild.id] = {};
+  if (!state[message.guild.id][message.author.id]) {
+    state[message.guild.id][message.author.id] = {
+      totalActions: 0,
+      lastRule: null,
+      lastAction: null,
+      lastAt: null,
+      lastPunishmentAt: 0,
+      punishmentCooldownUntil: 0,
+      lastSuppressedAt: null,
+      lastSuppressedRule: null
+    };
+  }
+  const userState = state[message.guild.id][message.author.id];
+
+  if (Number(userState.punishmentCooldownUntil) > now) {
+    await message.delete().catch(() => {});
+    userState.lastSuppressedAt = now;
+    userState.lastSuppressedRule = trigger.rule;
+    saveAutomodState(state);
+    governance.incrementAnalytics(message.guild.id, "automodSuppressedByCooldown", 1);
+    runDetached("automod-cooldown-log", () => sendTypedLog(
+      message.guild,
+      "moderation",
+      "AutoMod Action Suppressed",
+      `${message.author.tag} matched ${trigger.rule}, but punishment was suppressed by cooldown.`,
+      "info",
+      [
+        { name: "Rule", value: trigger.rule, inline: true },
+        { name: "Cooldown Remaining", value: `${Math.ceil((userState.punishmentCooldownUntil - now) / 1000)}s`, inline: true },
+        { name: "Evidence", value: (trigger.evidence || "n/a").slice(0, 1000) }
+      ]
+    ));
+    return false;
+  }
+
   const warningReason = `AutoMod (${trigger.rule}): ${trigger.reason}`;
   const offences = addWarning(message.guild.id, message.author.id, "AutoMod", warningReason);
   governance.incrementAnalytics(message.guild.id, "automodTriggers", 1);
@@ -737,6 +814,22 @@ async function applyAutoModAction(message, trigger) {
     selected = { action: "timeout", durationMs: settings.timeoutMs };
   }
 
+  if (shouldSkipAutoModDuplicate(message.guild.id, message.author.id, selected.action, trigger.rule, settings)) {
+    await message.delete().catch(() => {});
+    governance.incrementAnalytics(message.guild.id, "automodSuppressedByDedupe", 1);
+    runDetached("automod-dedupe-log", () => sendTypedLog(
+      message.guild,
+      "moderation",
+      "AutoMod Duplicate Suppressed",
+      `${message.author.tag} matched ${trigger.rule}, but a duplicate action was suppressed.`,
+      "info",
+      [{ name: "Rule", value: trigger.rule, inline: true }]
+    ));
+    return false;
+  }
+
+  await message.delete().catch(() => {});
+
   if (selected.action === "ban") {
     action = "ban";
     actionDetail = "Banned user for repeated AutoMod violations";
@@ -758,66 +851,53 @@ async function applyAutoModAction(message, trigger) {
     actionDetail = "Deleted message";
   }
 
-  await message.author.send({
-    embeds: [makeEmbed("AutoMod Action", `Rule: **${trigger.rule}**\nReason: ${trigger.reason}\nAction: **${actionDetail}**`, "warn")]
-  }).catch(() => {});
-
-  await sendTypedLog(message.guild, "moderation", "AutoMod Action", `${message.author.tag} triggered ${trigger.rule}.`, "warn", [
-    { name: "Rule", value: trigger.rule, inline: true },
-    { name: "Action", value: action, inline: true },
-    { name: "Severity", value: String(severity), inline: true },
-    { name: "Risk", value: String(riskScore), inline: true },
-    { name: "Warnings", value: String(offences), inline: true },
-    { name: "Evidence", value: (trigger.evidence || "n/a").slice(0, 1000) },
-    { name: "Message", value: (message.content || "[attachment-only]").slice(0, 1000) }
-  ]);
-
-  const autoCase = addCaseAndTimeline(
-    message.guild.id,
-    "automod",
-    client.user?.id || "system",
-    message.author.id,
-    `${trigger.rule}: ${trigger.reason}`,
-    durationMs,
-    { action, evidence: trigger.evidence || null, severity, warnings: offences, risk: riskScore }
-  );
-
-  appendModerationLog({
-    type: "automod",
-    guildId: message.guild.id,
-    userId: message.author.id,
-    rule: trigger.rule,
-    reason: trigger.reason,
-    evidence: trigger.evidence || null,
-    action,
-    warnings: offences,
-    caseId: autoCase.caseId,
-    time: Date.now()
-  });
-  governance.appendTimeline({
-    guildId: guild.id,
-    type: "antinuke-alert",
-    actorId: member.id,
-    targetId: null,
-    reason: action,
-    details: { counts, target: extra.target || null }
-  });
-
-  const state = loadAutomodState();
-  if (!state[message.guild.id]) state[message.guild.id] = {};
-  if (!state[message.guild.id][message.author.id]) {
-    state[message.guild.id][message.author.id] = {
-      totalActions: 0,
-      lastRule: null,
-      lastAction: null,
-      lastAt: null
-    };
-  }
-  state[message.guild.id][message.author.id].totalActions += 1;
-  state[message.guild.id][message.author.id].lastRule = trigger.rule;
-  state[message.guild.id][message.author.id].lastAction = action;
-  state[message.guild.id][message.author.id].lastAt = Date.now();
+  const punishmentAt = Date.now();
+  userState.totalActions += 1;
+  userState.lastRule = trigger.rule;
+  userState.lastAction = action;
+  userState.lastAt = punishmentAt;
+  userState.lastPunishmentAt = punishmentAt;
+  userState.punishmentCooldownUntil = punishmentAt + settings.punishmentCooldownMs;
   saveAutomodState(state);
+
+  runDetached("automod-dm", () => message.author.send({
+    embeds: [makeEmbed("AutoMod Action", `Rule: **${trigger.rule}**\nReason: ${trigger.reason}\nAction: **${actionDetail}**`, "warn")]
+  }).catch(() => {}));
+
+  runDetached("automod-log", async () => {
+    sendTypedLog(message.guild, "moderation", "AutoMod Action", `${message.author.tag} triggered ${trigger.rule}.`, "warn", [
+      { name: "Rule", value: trigger.rule, inline: true },
+      { name: "Action", value: action, inline: true },
+      { name: "Severity", value: String(severity), inline: true },
+      { name: "Risk", value: String(riskScore), inline: true },
+      { name: "Warnings", value: String(offences), inline: true },
+      { name: "Evidence", value: (trigger.evidence || "n/a").slice(0, 1000) },
+      { name: "Message", value: (message.content || "[attachment-only]").slice(0, 1000) }
+    ]);
+
+    const autoCase = addCaseAndTimeline(
+      message.guild.id,
+      "automod",
+      client.user?.id || "system",
+      message.author.id,
+      `${trigger.rule}: ${trigger.reason}`,
+      durationMs,
+      { action, evidence: trigger.evidence || null, severity, warnings: offences, risk: riskScore }
+    );
+
+    appendModerationLog({
+      type: "automod",
+      guildId: message.guild.id,
+      userId: message.author.id,
+      rule: trigger.rule,
+      reason: trigger.reason,
+      evidence: trigger.evidence || null,
+      action,
+      warnings: offences,
+      caseId: autoCase.caseId,
+      time: Date.now()
+    });
+  });
 
   return true;
 }
@@ -829,30 +909,34 @@ function canUseModCommand(member) {
 async function sendLog(guild, title, description, type = "info", fields = []) {
   const ch = getLogChannelByType(guild, "general");
   if (!ch) return;
-  await queueLogSend(ch, { embeds: [makeEmbed(title, description, type, fields)] });
+  queueLogSend(ch, { embeds: [makeEmbed(title, description, type, fields)] });
 }
 
 async function sendTypedLog(guild, kind, title, description, type = "info", fields = []) {
   const ch = getLogChannelByType(guild, kind);
   if (!ch) return;
-  await queueLogSend(ch, { embeds: [makeEmbed(title, description, type, fields)] });
+  queueLogSend(ch, { embeds: [makeEmbed(title, description, type, fields)] });
 }
 
-async function queueLogSend(channel, payload) {
+function queueLogSend(channel, payload) {
   const channelId = channel.id;
-  const queue = logQueueByChannel.get(channelId) || [];
-  queue.push(payload);
+  const queue = logQueueByChannel.get(channelId) || { items: [], processing: false, channel, channelId };
+  queue.items.push(payload);
   logQueueByChannel.set(channelId, queue);
-  if (queue.processing) return;
+  if (!queue.processing) drainLogQueue(queue);
+}
+
+function drainLogQueue(queue) {
   queue.processing = true;
-
-  while (queue.length) {
-    const next = queue.shift();
-    await channel.send(next).catch(() => {});
-    await new Promise(resolve => setTimeout(resolve, 350));
-  }
-
-  queue.processing = false;
+  runDetached(`log-queue:${queue.channelId}`, async () => {
+    while (queue.items.length) {
+      const next = queue.items.shift();
+      await queue.channel.send(next).catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, 350));
+    }
+    queue.processing = false;
+    if (queue.items.length) drainLogQueue(queue);
+  });
 }
 
 async function sendTranscript(guild, ticketChannel, lines) {
@@ -1051,6 +1135,24 @@ function isTrustedAntiNukeActor(guild, member, settings) {
   return false;
 }
 
+function getProtectedRoleNameSet(settings = null) {
+  const antinukeSettings = settings || getAntiNukeSettings();
+  return new Set(["founder", ...(antinukeSettings.protectedRoles || []).map(name => String(name || "").toLowerCase())]);
+}
+
+function isProtectedRoleName(name, settings = null) {
+  return getProtectedRoleNameSet(settings).has(String(name || "").toLowerCase());
+}
+
+function memberHasProtectedRole(member, settings = null) {
+  if (!member?.roles?.cache?.size) return false;
+  const protectedNames = getProtectedRoleNameSet(settings);
+  for (const role of member.roles.cache.values()) {
+    if (protectedNames.has(String(role.name || "").toLowerCase())) return true;
+  }
+  return false;
+}
+
 function getProtectionImmunity(member, guild, settings = null) {
   if (!member) {
     return { immune: true, reason: "missing-member" };
@@ -1084,8 +1186,12 @@ function getDangerousPermissionFlags() {
   ];
 }
 
-async function stripDangerousPermsFromMember(member, reason) {
+async function stripDangerousPermsFromMember(member, reason, settings = null) {
+  if (!member) return;
+  if (memberHasProtectedRole(member, settings)) return;
+  const protectedNames = getProtectedRoleNameSet(settings);
   for (const role of member.roles.cache.values()) {
+    if (protectedNames.has(String(role.name || "").toLowerCase())) continue;
     if (role.managed || role.id === member.guild.id || !role.editable) continue;
     const perms = new PermissionsBitField(role.permissions.bitfield);
     const before = perms.bitfield;
@@ -1127,6 +1233,29 @@ function recordAntiNuke(guildId, userId, action, settings) {
     actionThreshold,
     globalThreshold: settings.threshold
   };
+}
+
+function getAntiNukePunishmentCooldownRemaining(guildId, userId, settings) {
+  const data = readJson(antinukePath, {});
+  const record = data?.[guildId]?.[userId];
+  const lastPunishmentAt = Number(record?.lastPunishmentAt) || 0;
+  if (!lastPunishmentAt) return 0;
+  return Math.max(0, (lastPunishmentAt + settings.punishmentCooldownMs) - Date.now());
+}
+
+function markAntiNukePunishment(guildId, userId, action) {
+  const data = readJson(antinukePath, {});
+  if (!data[guildId]) data[guildId] = {};
+  if (!data[guildId][userId]) data[guildId][userId] = { events: [] };
+  if (Array.isArray(data[guildId][userId])) {
+    data[guildId][userId] = { events: data[guildId][userId] };
+  }
+  if (!Array.isArray(data[guildId][userId].events)) {
+    data[guildId][userId].events = [];
+  }
+  data[guildId][userId].lastPunishmentAt = Date.now();
+  data[guildId][userId].lastPunishmentAction = action;
+  writeJson(antinukePath, data);
 }
 
 async function antiNukeCheck(guild, executorId, action, extra = {}) {
@@ -1177,9 +1306,35 @@ async function antiNukeCheck(guild, executorId, action, extra = {}) {
   const shouldPunish = counts.actionCount >= counts.actionThreshold || counts.globalCount >= counts.globalThreshold;
   if (!shouldPunish) return;
 
+  const cooldownRemaining = getAntiNukePunishmentCooldownRemaining(guild.id, member.id, settings);
+  if (cooldownRemaining > 0) {
+    sendTypedLog(guild, "security", "Anti-Nuke Action Suppressed", `${member.user.tag} hit anti-nuke thresholds, but action was suppressed due to cooldown.`, "warn", [
+      { name: "Action", value: action, inline: true },
+      { name: "Cooldown Remaining", value: `${Math.ceil(cooldownRemaining / 1000)}s`, inline: true }
+    ]);
+    appendModerationLog({
+      type: "antinuke-action-suppressed",
+      guildId: guild.id,
+      userId: member.id,
+      action,
+      counts,
+      cooldownRemainingMs: cooldownRemaining,
+      time: Date.now()
+    });
+    governance.appendTimeline({
+      guildId: guild.id,
+      type: "antinuke-action-suppressed",
+      actorId: client.user?.id || "system",
+      targetId: member.id,
+      reason: `Suppressed duplicate anti-nuke action for ${action}`,
+      details: { cooldownRemainingMs: cooldownRemaining }
+    });
+    return;
+  }
+
   const reason = `Anti-nuke triggered (${action})`;
   if (settings.emergency.stripDangerousPermissions) {
-    await stripDangerousPermsFromMember(member, reason);
+    await stripDangerousPermsFromMember(member, reason, settings);
   }
   if (settings.emergency.timeoutOffender && member.moderatable) {
     await member.timeout(settings.punishmentTimeoutMs, reason).catch(() => {});
@@ -1193,6 +1348,8 @@ async function antiNukeCheck(guild, executorId, action, extra = {}) {
   if (settings.emergency.panicLockdown) {
     await panicLockdown(guild, "Anti-nuke lockdown triggered").catch(() => {});
   }
+
+  markAntiNukePunishment(guild.id, member.id, action);
 
   await sendTypedLog(guild, "security", "Anti-Nuke Action", `${member.user.tag} hit anti-nuke thresholds. Emergency response executed.`, "error", [
     { name: "Action", value: action, inline: true },
@@ -1373,12 +1530,13 @@ function shouldSkipAntiNukeDuplicate(guildId, executorId, action, target = "") {
   const now = Date.now();
   const last = antiNukeDedupe.get(key) || 0;
   antiNukeDedupe.set(key, now);
+  const dedupeWindowMs = getAntiNukeSettings().actionDedupeMs;
 
   for (const [k, t] of antiNukeDedupe.entries()) {
-    if (now - t > 30000) antiNukeDedupe.delete(k);
+    if (now - t > Math.max(30000, dedupeWindowMs * 4)) antiNukeDedupe.delete(k);
   }
 
-  return now - last < 2500;
+  return now - last < dedupeWindowMs;
 }
 
 function londonNowParts() {
@@ -1654,16 +1812,17 @@ client.on(Events.MessageCreate, async message => {
   if (!message.content && !message.attachments?.size) return;
   governance.incrementAnalytics(message.guild.id, "messagesSeen", 1);
 
-  const afk = loadAFK();
+  const afk = getAFKStateCached();
   if (afk[message.author.id]) {
-    delete afk[message.author.id];
-    saveAFK(afk);
-    await message.reply("Welcome back, AFK removed.").catch(() => {});
+    updateAFKStateAndPersist(current => {
+      delete current[message.author.id];
+    });
+    runDetached("afk-return-reply", () => message.reply("Welcome back, AFK removed.").catch(() => {}));
   }
 
-  message.mentions.users.forEach(async user => {
+  message.mentions.users.forEach(user => {
     if (afk[user.id]) {
-      await message.reply(`${user.tag} is AFK: ${afk[user.id]}`).catch(() => {});
+      runDetached("afk-mention-reply", () => message.reply(`${user.tag} is AFK: ${afk[user.id]}`).catch(() => {}));
     }
   });
 
@@ -1684,7 +1843,7 @@ client.on(Events.MessageCreate, async message => {
   const trigger = detectAutoModTrigger(message, settings);
   if (!trigger) return;
 
-  await applyAutoModAction(message, trigger);
+  applyAutoModAction(message, trigger).catch(err => logRuntimeError("automod-action", err));
   return;
 });
 
@@ -1757,27 +1916,16 @@ client.on(Events.RoleUpdate, async (oldRole, newRole) => {
     await sendTypedLog(newRole.guild, "moderation", "Role Updated", `${oldRole.name} renamed to ${newRole.name}.`, "info");
   }
 
+  const antinukeCfg = getAntiNukeSettings();
+  if (isProtectedRoleName(newRole.name, antinukeCfg)) {
+    return;
+  }
+
   const before = new PermissionsBitField(oldRole.permissions.bitfield);
   const after = new PermissionsBitField(newRole.permissions.bitfield);
   const dangerous = getDangerousPermissionFlags();
   const escalated = dangerous.some(flag => !before.has(flag) && after.has(flag));
   if (!escalated) return;
-
-  const antinukeCfg = getAntiNukeSettings();
-  const protectedRoles = antinukeCfg.protectedRoles || [];
-  if (protectedRoles.some(name => name.toLowerCase() === newRole.name.toLowerCase())) {
-    await newRole.setPermissions(oldRole.permissions, "Permission guard auto-revert").catch(() => {});
-    await sendTypedLog(newRole.guild, "security", "Permission Guard Revert", `Dangerous permission escalation on protected role ${newRole.name} was reverted.`, "error");
-    governance.incrementAnalytics(newRole.guild.id, "permissionReverts", 1);
-    governance.appendTimeline({
-      guildId: newRole.guild.id,
-      type: "permission-revert",
-      actorId: client.user?.id || "system",
-      targetId: null,
-      reason: `Protected role ${newRole.name} permission escalation reverted`
-    });
-    return;
-  }
 
   const executorId = await fetchExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
   if (executorId) await antiNukeCheck(newRole.guild, executorId, "rolePermissionEscalation", { target: newRole.name });
@@ -2756,9 +2904,9 @@ if (cmd === "poll") {
 
       if (cmd === "afk") {
         const reason = interaction.options.getString("reason") || "AFK";
-        const afk = loadAFK();
-        afk[interaction.user.id] = reason;
-        saveAFK(afk);
+        updateAFKStateAndPersist(current => {
+          current[interaction.user.id] = reason;
+        });
 
         await interaction.reply({ embeds: [makeEmbed("AFK Set", reason, "info")] });
         return;

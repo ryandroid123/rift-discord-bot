@@ -42,7 +42,12 @@ async function createTicketsCategoryIfMissing(guild) {
 
 async function panicLockdown(guild, reason = "Anti-nuke lockdown") {
   const roles = getStaffRoles(guild);
+  const protectedRoleNames = new Set([
+    "founder",
+    ...((config.antinuke?.protectedRoles || []).map(name => String(name || "").toLowerCase()))
+  ]);
   for (const role of roles) {
+    if (protectedRoleNames.has(String(role.name || "").toLowerCase())) continue;
     const perms = new PermissionsBitField(role.permissions.bitfield);
     perms.remove(
       PermissionsBitField.Flags.ManageChannels,

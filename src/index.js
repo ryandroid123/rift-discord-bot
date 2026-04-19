@@ -95,8 +95,10 @@ const streamCheckState = { running: false };
 const antiNukeDedupe = new Map();
 const coordinatedSpamCache = new Map();
 const autoModActionDedupe = new Map();
+const automodRecoveryDedupe = new Map();
 let afkCache = null;
 let startupCompleted = false;
+const AUTOMOD_WARNING_PREFIX = "AutoMod (";
 
 function logRuntimeError(label, error) {
   if (!error) {
@@ -387,6 +389,129 @@ function saveAutomodState(data) {
   writeJson(automodPath, data);
 }
 
+function createDefaultAutomodUserState() {
+  return {
+    totalActions: 0,
+    lastRule: null,
+    lastAction: null,
+    lastAt: null,
+    lastPunishmentAt: 0,
+    punishmentCooldownUntil: 0,
+    lastSuppressedAt: null,
+    lastSuppressedRule: null,
+    graceStartedAt: 0,
+    graceUntil: 0,
+    enforcementResetAt: 0,
+    lastRecoveryAt: 0,
+    lastRecoveryReason: null,
+    lastRecoveryBy: null
+  };
+}
+
+function getAutomodUserState(state, guildId, userId) {
+  if (!state[guildId]) state[guildId] = {};
+  if (!state[guildId][userId]) {
+    state[guildId][userId] = createDefaultAutomodUserState();
+  } else {
+    state[guildId][userId] = {
+      ...createDefaultAutomodUserState(),
+      ...state[guildId][userId]
+    };
+  }
+  return state[guildId][userId];
+}
+
+function shouldSkipAutomodRecovery(guildId, userId, windowMs = 5000) {
+  const key = `${guildId}:${userId}`;
+  const now = Date.now();
+  const last = automodRecoveryDedupe.get(key) || 0;
+  automodRecoveryDedupe.set(key, now);
+
+  for (const [k, t] of automodRecoveryDedupe.entries()) {
+    if (now - t > Math.max(60000, windowMs * 8)) automodRecoveryDedupe.delete(k);
+  }
+
+  return now - last < windowMs;
+}
+
+function clearAutomodRuntimeCacheForUser(guildId, userId) {
+  const key = `${guildId}:${userId}`;
+  automodCache.delete(key);
+
+  const dedupePrefix = `${guildId}:${userId}:`;
+  for (const dedupeKey of autoModActionDedupe.keys()) {
+    if (dedupeKey.startsWith(dedupePrefix)) autoModActionDedupe.delete(dedupeKey);
+  }
+
+  for (const [coordKey, coordItem] of coordinatedSpamCache.entries()) {
+    if (!coordItem?.users) continue;
+    coordItem.users.delete(userId);
+    if (!coordItem.users.size) coordinatedSpamCache.delete(coordKey);
+  }
+}
+
+function clearAutomodWarningsForUser(guildId, userId) {
+  const data = loadWarnings();
+  const existing = data[guildId]?.[userId];
+  if (!Array.isArray(existing) || !existing.length) return 0;
+
+  const kept = existing.filter(w => !String(w.reason || "").startsWith(AUTOMOD_WARNING_PREFIX));
+  const removed = existing.length - kept.length;
+  if (!removed) return 0;
+
+  data[guildId][userId] = kept;
+  saveWarnings(data);
+  return removed;
+}
+
+function getAutomodWarningsCount(guildId, userId, since = 0) {
+  const warnings = getWarnings(guildId, userId);
+  return warnings.filter(w => String(w.reason || "").startsWith(AUTOMOD_WARNING_PREFIX) && Number(w.time || 0) >= since).length;
+}
+
+function activateAutomodRecovery(guild, userId, options = {}) {
+  if (!guild || !userId) return null;
+  if (shouldSkipAutomodRecovery(guild.id, userId, options.dedupeWindowMs || 5000)) return null;
+
+  const now = Date.now();
+  const settings = getAutoModSettings();
+  const graceMs = settings.recoveryGraceMs;
+
+  clearAutomodRuntimeCacheForUser(guild.id, userId);
+  const removedWarnings = clearAutomodWarningsForUser(guild.id, userId);
+
+  const riskBefore = governance.getRisk(guild.id, userId);
+  const targetRisk = Math.min(riskBefore, settings.recoveryRiskFloor);
+  const riskDelta = targetRisk - riskBefore;
+  if (riskDelta !== 0) {
+    governance.adjustRisk(guild.id, userId, riskDelta, `automod-recovery:${options.reason || "timeout-recovered"}`);
+  }
+
+  const state = loadAutomodState();
+  const userState = getAutomodUserState(state, guild.id, userId);
+  userState.lastRule = null;
+  userState.lastAction = null;
+  userState.lastAt = null;
+  userState.lastPunishmentAt = 0;
+  userState.punishmentCooldownUntil = 0;
+  userState.lastSuppressedAt = null;
+  userState.lastSuppressedRule = null;
+  userState.graceStartedAt = now;
+  userState.graceUntil = now + graceMs;
+  userState.enforcementResetAt = now;
+  userState.lastRecoveryAt = now;
+  userState.lastRecoveryReason = options.reason || "timeout-recovered";
+  userState.lastRecoveryBy = options.actorId || null;
+  saveAutomodState(state);
+
+  return {
+    graceMs,
+    removedWarnings,
+    riskBefore,
+    riskAfter: governance.getRisk(guild.id, userId)
+  };
+}
+
 function appendModerationLog(entry) {
   const items = readJson(moderationLogPath, []);
   items.push(entry);
@@ -435,6 +560,8 @@ function getAutoModSettings() {
     antiPhishing: automod.antiPhishing !== false,
     punishmentCooldownMs: Math.min(10 * 60 * 1000, Math.max(5 * 60 * 1000, automod.punishmentCooldownMs ?? 7 * 60 * 1000)),
     actionDedupeMs: Math.max(1000, automod.actionDedupeMs ?? 4000),
+    recoveryGraceMs: Math.max(30 * 1000, Math.min(10 * 60 * 1000, automod.recoveryGraceMs ?? 90 * 1000)),
+    recoveryRiskFloor: Math.max(0, Math.min(40, automod.recoveryRiskFloor ?? 12)),
     adaptive: automod.adaptive || { enabled: false, maxRiskTightening: 0 },
     context: automod.context || { safeChannels: [], strictChannels: [] },
     escalationLadder: automod.escalationLadder || []
@@ -736,20 +863,7 @@ async function applyAutoModAction(message, trigger) {
 
   const now = Date.now();
   const state = loadAutomodState();
-  if (!state[message.guild.id]) state[message.guild.id] = {};
-  if (!state[message.guild.id][message.author.id]) {
-    state[message.guild.id][message.author.id] = {
-      totalActions: 0,
-      lastRule: null,
-      lastAction: null,
-      lastAt: null,
-      lastPunishmentAt: 0,
-      punishmentCooldownUntil: 0,
-      lastSuppressedAt: null,
-      lastSuppressedRule: null
-    };
-  }
-  const userState = state[message.guild.id][message.author.id];
+  const userState = getAutomodUserState(state, message.guild.id, message.author.id);
 
   if (Number(userState.punishmentCooldownUntil) > now) {
     await message.delete().catch(() => {});
@@ -773,7 +887,8 @@ async function applyAutoModAction(message, trigger) {
   }
 
   const warningReason = `AutoMod (${trigger.rule}): ${trigger.reason}`;
-  const offences = addWarning(message.guild.id, message.author.id, "AutoMod", warningReason);
+  addWarning(message.guild.id, message.author.id, "AutoMod", warningReason);
+  const offences = getAutomodWarningsCount(message.guild.id, message.author.id, Number(userState.enforcementResetAt) || 0);
   governance.incrementAnalytics(message.guild.id, "automodTriggers", 1);
   const riskScore = adjustRiskForRule(message.guild.id, message.author.id, trigger.rule);
   const severityBase = Math.min(10, Math.max(1, Math.floor(offences / 2) + Math.floor(riskScore / 15)));
@@ -814,6 +929,33 @@ async function applyAutoModAction(message, trigger) {
 
   if (selected.requireFlag && settings[selected.requireFlag] !== true) {
     selected = { action: "timeout", durationMs: settings.timeoutMs };
+  }
+
+  const historyRules = new Set([
+    "rapid-spam",
+    "repeat-spam",
+    "duplicate-message",
+    "slow-spam",
+    "coordinated-spam",
+    "repeated-link-spam",
+    "repeated-attachment-spam"
+  ]);
+  const inRecoveryGrace = Number(userState.graceUntil) > now;
+  if (inRecoveryGrace && historyRules.has(trigger.rule) && ["timeout", "kick", "ban"].includes(selected.action)) {
+    selected = { action: "warn" };
+    governance.incrementAnalytics(message.guild.id, "automodSuppressedByGrace", 1);
+    runDetached("automod-grace-log", () => sendTypedLog(
+      message.guild,
+      "moderation",
+      "AutoMod Grace Suppression",
+      `${message.author.tag} matched ${trigger.rule}, but escalation was suppressed during recovery grace.`,
+      "info",
+      [
+        { name: "Rule", value: trigger.rule, inline: true },
+        { name: "Grace Remaining", value: `${Math.ceil((userState.graceUntil - now) / 1000)}s`, inline: true },
+        { name: "Evidence", value: (trigger.evidence || "n/a").slice(0, 1000) }
+      ]
+    ));
   }
 
   if (shouldSkipAutoModDuplicate(message.guild.id, message.author.id, selected.action, trigger.rule, settings)) {
@@ -2171,6 +2313,32 @@ client.on(Events.GuildAuditLogEntryCreate, async entry => {
   });
 });
 
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  const beforeTimeout = Number(oldMember.communicationDisabledUntilTimestamp || 0);
+  const afterTimeout = Number(newMember.communicationDisabledUntilTimestamp || 0);
+  const now = Date.now();
+  const hadTimeout = beforeTimeout > now;
+  const hasTimeout = afterTimeout > now;
+  if (!hadTimeout || hasTimeout) return;
+
+  const recovery = activateAutomodRecovery(newMember.guild, newMember.id, { reason: "timeout-ended" });
+  if (!recovery) return;
+
+  const userTag = newMember.user?.tag || newMember.id;
+  await sendTypedLog(
+    newMember.guild,
+    "moderation",
+    "AutoMod Recovery Grace",
+    `${userTag} timeout ended; stale automod state was reset and grace mode was applied.`,
+    "info",
+    [
+      { name: "Grace", value: `${Math.floor(recovery.graceMs / 1000)}s`, inline: true },
+      { name: "Warnings Cleared", value: String(recovery.removedWarnings), inline: true },
+      { name: "Risk", value: `${recovery.riskBefore} -> ${recovery.riskAfter}`, inline: true }
+    ]
+  );
+});
+
 client.on(Events.InteractionCreate, async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
@@ -2325,10 +2493,72 @@ client.on(Events.InteractionCreate, async interaction => {
         await target.timeout(null, reason);
         await interaction.reply({ embeds: [makeEmbed("Timeout Removed", `${user.tag}'s timeout was removed.`, "success")] });
 
+        const recovery = activateAutomodRecovery(interaction.guild, user.id, {
+          reason: `manual-untimeout:${reason}`,
+          actorId: interaction.user.id
+        });
+        if (recovery) {
+          await sendTypedLog(interaction.guild, "moderation", "AutoMod Recovery Reset", `${interaction.user.tag} reset automod state for ${user.tag} after untimeout.`, "info", [
+            { name: "Grace", value: `${Math.floor(recovery.graceMs / 1000)}s`, inline: true },
+            { name: "Warnings Cleared", value: String(recovery.removedWarnings), inline: true },
+            { name: "Risk", value: `${recovery.riskBefore} -> ${recovery.riskAfter}`, inline: true }
+          ]);
+        }
+
         await sendTypedLog(interaction.guild, "member", "Timeout Removed", `${interaction.user.tag} removed ${user.tag}'s timeout.`, "success", [
           { name: "Reason", value: reason }
         ]);
         addCaseAndTimeline(interaction.guild.id, "untimeout", interaction.user.id, user.id, reason, null, {});
+        return;
+      }
+
+      if (cmd === "clearautomod") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
+
+        const user = interaction.options.getUser("user");
+        const reason = interaction.options.getString("reason") || "No reason provided";
+        const target = await interaction.guild.members.fetch(user.id).catch(() => null);
+        if (!target) {
+          await interaction.reply({ embeds: [makeEmbed("Error", "User not found.", "error")], ephemeral: true });
+          return;
+        }
+
+        const recovery = activateAutomodRecovery(interaction.guild, user.id, {
+          reason: `manual-clearautomod:${reason}`,
+          actorId: interaction.user.id,
+          dedupeWindowMs: 1500
+        });
+        if (!recovery) {
+          await interaction.reply({ embeds: [makeEmbed("Skipped", "AutoMod reset was already applied moments ago.", "info")], ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({
+          embeds: [
+            makeEmbed(
+              "AutoMod State Reset",
+              `${user.tag} automod carryover was cleared.\nGrace: **${Math.floor(recovery.graceMs / 1000)}s**\nWarnings cleared: **${recovery.removedWarnings}**\nRisk: **${recovery.riskBefore} -> ${recovery.riskAfter}**`,
+              "success"
+            )
+          ]
+        });
+
+        await sendTypedLog(interaction.guild, "moderation", "AutoMod State Reset", `${interaction.user.tag} reset automod state for ${user.tag}.`, "info", [
+          { name: "Reason", value: reason },
+          { name: "Grace", value: `${Math.floor(recovery.graceMs / 1000)}s`, inline: true },
+          { name: "Warnings Cleared", value: String(recovery.removedWarnings), inline: true },
+          { name: "Risk", value: `${recovery.riskBefore} -> ${recovery.riskAfter}`, inline: true }
+        ]);
+
+        addCaseAndTimeline(interaction.guild.id, "automod-reset", interaction.user.id, user.id, reason, null, {
+          graceMs: recovery.graceMs,
+          warningsCleared: recovery.removedWarnings,
+          riskBefore: recovery.riskBefore,
+          riskAfter: recovery.riskAfter
+        });
         return;
       }
 

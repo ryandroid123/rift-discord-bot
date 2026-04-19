@@ -24,6 +24,14 @@ module.exports = [
     ]
   },
   {
+    name: "clearautomod",
+    description: "Clear automod carryover state and apply recovery grace.",
+    options: [
+      { name: "user", type: 6, required: true, description: "User" },
+      { name: "reason", type: 3, required: false, description: "Reason" }
+    ]
+  },
+  {
     name: "ban",
     description: "Ban a member.",
     options: [

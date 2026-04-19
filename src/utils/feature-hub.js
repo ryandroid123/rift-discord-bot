@@ -62,6 +62,9 @@ for (const file of Object.values(DATA_FILES)) {
 const xpCooldown = new Map();
 const selfbotWindow = new Map();
 const stickyCooldown = new Map();
+let profilesCache = null;
+let profilesDirty = false;
+let profilesFlushTimer = null;
 
 function load(name, fallback) {
   const file = DATA_FILES[name];
@@ -71,6 +74,27 @@ function load(name, fallback) {
 function save(name, value) {
   const file = DATA_FILES[name];
   writeJson(resolveDataPath(file), value);
+}
+
+function getProfilesData() {
+  if (!profilesCache) profilesCache = load("profiles", {});
+  return profilesCache;
+}
+
+function flushProfilesNow() {
+  if (!profilesCache || !profilesDirty) return;
+  save("profiles", profilesCache);
+  profilesDirty = false;
+}
+
+function scheduleProfilesFlush() {
+  profilesDirty = true;
+  if (profilesFlushTimer) return;
+  profilesFlushTimer = setTimeout(() => {
+    profilesFlushTimer = null;
+    flushProfilesNow();
+  }, 1500);
+  if (typeof profilesFlushTimer.unref === "function") profilesFlushTimer.unref();
 }
 
 function ensureGuild(data, guildId, fallback = {}) {
@@ -127,17 +151,17 @@ function ensureProfile(all, guildId, userId) {
 }
 
 function profile(guildId, userId) {
-  const all = load("profiles", {});
+  const all = getProfilesData();
   const p = ensureProfile(all, guildId, userId);
-  save("profiles", all);
+  scheduleProfilesFlush();
   return p;
 }
 
 function updateProfile(guildId, userId, updater) {
-  const all = load("profiles", {});
+  const all = getProfilesData();
   const p = ensureProfile(all, guildId, userId);
   updater(p);
-  save("profiles", all);
+  scheduleProfilesFlush();
   return p;
 }
 
@@ -272,6 +296,12 @@ async function maybeRunSchedules(client, ctx) {
 }
 
 async function onReady(client, ctx) {
+  getProfilesData();
+  const profileFlushTimer = setInterval(() => {
+    flushProfilesNow();
+  }, 30000);
+  if (typeof profileFlushTimer.unref === "function") profileFlushTimer.unref();
+
   const timer = setInterval(() => {
     maybeRunReminders(client, ctx).catch(() => {});
     maybeRunSchedules(client, ctx).catch(() => {});
@@ -710,7 +740,10 @@ async function handleCommand(interaction, ctx) {
   }
 
   if (cmd === "ticket") {
-    if (!ctx.canUseModCommand(interaction.member)) {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
       await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can manage tickets.", "error")], ephemeral: true });
       return true;
     }
@@ -760,14 +793,13 @@ async function handleCommand(interaction, ctx) {
       save("ticketMeta", all);
 
       const messages = await interaction.channel.messages.fetch({ limit: 200 }).catch(() => null);
-      const lines = [...(messages?.values() || [])]
-        .reverse()
-        .map(m => `[${new Date(m.createdTimestamp).toLocaleString()}] ${m.author.tag}: ${m.content || "[embed/attachment]"}`);
-      lines.unshift("# Ticket metadata");
-      lines.unshift(`Close reason: ${reason}`);
-      lines.unshift(`Claimed by: ${meta.claimedBy ? `<@${meta.claimedBy}>` : "Unclaimed"}`);
-
-      await ctx.sendTranscript(interaction.guild, interaction.channel, lines);
+      const orderedMessages = [...(messages?.values() || [])].reverse();
+      await ctx.sendTranscript(interaction.guild, interaction.channel, orderedMessages, {
+        ticketOwnerId: null,
+        closedBy: interaction.user.id,
+        closeReason: reason,
+        messageCount: orderedMessages.length
+      });
 
       const index = load("transcriptIndex", []);
       index.push({
@@ -777,7 +809,7 @@ async function handleCommand(interaction, ctx) {
         time: Date.now(),
         closedBy: interaction.user.id,
         reason,
-        preview: lines.slice(-8).join(" ").slice(0, 250)
+        preview: orderedMessages.map(m => m.content || "").join(" ").slice(0, 250)
       });
       save("transcriptIndex", index.slice(-5000));
 
@@ -959,7 +991,7 @@ async function handleCommand(interaction, ctx) {
       return true;
     }
     if (action === "leaderboard") {
-      const all = load("profiles", {});
+      const all = getProfilesData();
       const rows = Object.entries(all[guildId] || {})
         .sort((a, b) => (b[1].xp || 0) - (a[1].xp || 0))
         .slice(0, 10)
@@ -1704,7 +1736,10 @@ async function handleButton(interaction, ctx) {
   }
 
   if (interaction.customId === "claim_ticket") {
-    if (!ctx.canUseModCommand(interaction.member)) {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
       await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can claim tickets.", "error")], ephemeral: true });
       return true;
     }

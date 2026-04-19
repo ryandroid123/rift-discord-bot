@@ -151,9 +151,10 @@ function logChannel(guild) {
 function getLogChannelByType(guild, kind = "general") {
   const cfg = governance.mergeWithRuntime(config);
   const channels = cfg.channels || {};
+  const moderationPreferred = getChannelByName(guild, "📝┃mod-logs") || getChannelByName(guild, "mod-logs");
   const map = {
     general: channels.logs,
-    moderation: channels.moderationLogs || channels.logs,
+    moderation: moderationPreferred?.name || channels.moderationLogs || channels.logs,
     security: channels.securityLogs || channels.logs,
     message: channels.messageLogs || channels.logs,
     member: channels.memberLogs || channels.logs
@@ -907,12 +908,22 @@ function canUseModCommand(member) {
   return hasAnyRole(member, ["Founder", "Admin", "Moderator"]);
 }
 
+function canUseBasicModCommand(member) {
+  return hasAnyRole(member, ["Founder", "Admin", "Moderator", "Trial Moderator"]);
+}
+
+function canManageTicketsCommand(member) {
+  return canUseBasicModCommand(member);
+}
+
 function featureContext() {
   return {
     commands,
     makeEmbed,
     governance,
     canUseModCommand,
+    canUseBasicModCommand,
+    canManageTicketsCommand,
     currentConfig,
     getChannelByName,
     sendLog,
@@ -960,15 +971,97 @@ function drainLogQueue(queue) {
   });
 }
 
-async function sendTranscript(guild, ticketChannel, lines) {
+function parseTicketOwnerId(channel) {
+  const topic = String(channel?.topic || "");
+  const m = topic.match(/owner:(\d{15,25})/);
+  return m ? m[1] : null;
+}
+
+function formatTranscriptMessage(message) {
+  const ts = new Date(message.createdTimestamp || Date.now()).toISOString();
+  const author = message.author ? `${message.author.tag} (${message.author.id})` : "Unknown";
+  const text = String(message.content || "").trim();
+  const body = [];
+  body.push(`[${ts}] ${author}`);
+  body.push(text ? text : "[no text]");
+
+  const attachments = [...(message.attachments?.values?.() || [])];
+  if (attachments.length) {
+    body.push("Attachments:");
+    for (const a of attachments) {
+      const name = a.name || "file";
+      const url = a.url || a.proxyURL || "";
+      body.push(`- ${name}${url ? ` -> ${url}` : ""}`);
+    }
+  }
+
+  const embeds = [...(message.embeds || [])];
+  if (embeds.length) {
+    body.push("Embeds:");
+    embeds.forEach((e, idx) => {
+      const parts = [];
+      if (e.title) parts.push(`title="${String(e.title).slice(0, 200)}"`);
+      if (e.description) parts.push(`desc="${String(e.description).slice(0, 280)}"`);
+      if (e.url) parts.push(`url=${e.url}`);
+      if (e.type) parts.push(`type=${e.type}`);
+      body.push(`- [${idx + 1}] ${parts.join(" | ") || "embed"}`);
+    });
+  }
+
+  return body.join("\n");
+}
+
+function buildTranscriptText(ticketChannel, messages, meta = {}) {
+  const lines = [];
+  const nowIso = new Date().toISOString();
+  const ownerId = meta.ticketOwnerId || parseTicketOwnerId(ticketChannel);
+  const messageCount = messages.length;
+
+  lines.push(`# Transcript: ${ticketChannel?.name || "unknown-channel"}`);
+  lines.push(`Generated: ${nowIso}`);
+  lines.push(`Channel Created: ${ticketChannel?.createdTimestamp ? new Date(ticketChannel.createdTimestamp).toISOString() : "Unknown"}`);
+  lines.push(`Channel ID: ${ticketChannel?.id || "unknown"}`);
+  lines.push(`Ticket Owner: ${ownerId ? `<@${ownerId}> (${ownerId})` : "Unknown"}`);
+  lines.push(`Closed By: ${meta.closedBy ? `<@${meta.closedBy}> (${meta.closedBy})` : "Unknown"}`);
+  lines.push(`Close Reason: ${meta.closeReason || "No reason provided"}`);
+  lines.push(`Message Count: ${messageCount}`);
+  lines.push("");
+  lines.push("----- Conversation -----");
+  lines.push("");
+
+  if (!messages.length) {
+    lines.push("[Channel had no readable messages at close time.]");
+  } else {
+    for (const m of messages) {
+      lines.push(formatTranscriptMessage(m));
+      lines.push("");
+    }
+  }
+
+  const out = lines.join("\n").trim() + "\n";
+  return out;
+}
+
+async function sendTranscript(guild, ticketChannel, linesOrMessages, meta = {}) {
   const ch = transcriptChannel(guild);
   if (!ch) return;
 
-  const filePath = resolveDataPath("transcripts", `${ticketChannel.name}-${Date.now()}.txt`);
-  fs.writeFileSync(filePath, lines.join("\n"), "utf8");
+  const items = Array.isArray(linesOrMessages) ? linesOrMessages : [];
+  const isMessageObject = items.length ? typeof items[0] === "object" && items[0] !== null && "createdTimestamp" in items[0] : false;
+  const transcriptText = isMessageObject
+    ? buildTranscriptText(ticketChannel, items, meta)
+    : String((items || []).join("\n")).trim() + "\n";
+
+  const safeName = String(ticketChannel.name || "ticket").replace(/[^a-zA-Z0-9-_]/g, "_");
+  const filePath = resolveDataPath("transcripts", `${safeName}-${Date.now()}.txt`);
+  fs.writeFileSync(filePath, transcriptText, "utf8");
+  const sizeBytes = Buffer.byteLength(transcriptText, "utf8");
+  const sizeKb = (sizeBytes / 1024).toFixed(2);
 
   await ch.send({
-    embeds: [makeEmbed("Ticket Transcript", `Transcript saved from ${ticketChannel.name}`, "info")],
+    embeds: [makeEmbed("Ticket Transcript Saved", `Channel: ${ticketChannel.name}\nMessages: **${meta.messageCount || items.length || 0}**\nSize: **${sizeKb} KB**\nClosed By: ${meta.closedBy ? `<@${meta.closedBy}>` : "Unknown"}`, "info", [
+      { name: "Reason", value: (meta.closeReason || "No reason provided").slice(0, 1000) }
+    ])],
     files: [filePath]
   }).catch(() => {});
 
@@ -1020,6 +1113,7 @@ async function createTicket(guild, user, type, answers = null) {
     name: channelName,
     type: ChannelType.GuildText,
     parent: category.id,
+    topic: `owner:${user.id};type:${type}`,
     permissionOverwrites: buildTicketOverwrites(guild, user.id)
   });
 
@@ -2154,28 +2248,34 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "close") {
+        if (!canManageTicketsCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only staff can close tickets.", "error")], ephemeral: true });
+          return;
+        }
         if (!isTicketChannel(interaction.channel)) {
           await interaction.reply({ embeds: [makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
           return;
         }
 
         const messages = await interaction.channel.messages.fetch({ limit: 200 }).catch(() => null);
-        const lines = [...(messages?.values() || [])]
-          .reverse()
-          .map(m => `[${new Date(m.createdTimestamp).toLocaleString()}] ${m.author.tag}: ${m.content || "[embed/attachment]"}`);
-
-        await sendTranscript(interaction.guild, interaction.channel, lines);
+        const orderedMessages = [...(messages?.values() || [])].reverse();
+        await sendTranscript(interaction.guild, interaction.channel, orderedMessages, {
+          ticketOwnerId: parseTicketOwnerId(interaction.channel),
+          closedBy: interaction.user.id,
+          closeReason: "Closed via /close",
+          messageCount: orderedMessages.length
+        });
 
         await interaction.reply({ embeds: [makeEmbed("Closing Ticket", "This ticket will be deleted in 5 seconds.", "warn")] });
-        await sendLog(interaction.guild, "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn");
+        await sendTypedLog(interaction.guild, "moderation", "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn");
 
         setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
         return;
       }
 
       if (cmd === "timeout") {
-        if (!canUseModCommand(member)) {
-          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+        if (!canUseBasicModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Trial Moderator or higher can use this.", "error")], ephemeral: true });
           return;
         }
 
@@ -2194,6 +2294,10 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.reply({ embeds: [makeEmbed("Timed Out", `${user.tag} has been timed out.`, "warn")] });
 
         await sendTypedLog(interaction.guild, "member", "Member Timed Out", `${interaction.user.tag} timed out ${user.tag}.`, "warn", [
+          { name: "Duration", value: duration, inline: true },
+          { name: "Reason", value: reason, inline: true }
+        ]);
+        await sendTypedLog(interaction.guild, "moderation", "Timeout Action", `${interaction.user.tag} timed out ${user.tag}.`, "warn", [
           { name: "Duration", value: duration, inline: true },
           { name: "Reason", value: reason, inline: true }
         ]);
@@ -2229,6 +2333,10 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "ban") {
+        if (!canUseModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+          return;
+        }
         const user = interaction.options.getUser("user");
         const reason = interaction.options.getString("reason") || "No reason provided";
 
@@ -2245,6 +2353,10 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "kick") {
+        if (!canUseBasicModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Trial Moderator or higher can use this.", "error")], ephemeral: true });
+          return;
+        }
         const user = interaction.options.getUser("user");
         const reason = interaction.options.getString("reason") || "No reason provided";
         const target = await interaction.guild.members.fetch(user.id).catch(() => null);
@@ -2258,6 +2370,9 @@ client.on(Events.InteractionCreate, async interaction => {
 
         await interaction.reply({ embeds: [makeEmbed("Member Kicked", `${user.tag} has been kicked.`, "warn")] });
         await sendTypedLog(interaction.guild, "member", "Member Kicked", `${interaction.user.tag} kicked ${user.tag}.`, "warn", [
+          { name: "Reason", value: reason }
+        ]);
+        await sendTypedLog(interaction.guild, "moderation", "Kick Action", `${interaction.user.tag} kicked ${user.tag}.`, "warn", [
           { name: "Reason", value: reason }
         ]);
         const c = addCaseAndTimeline(interaction.guild.id, "kick", interaction.user.id, user.id, reason, null, {});
@@ -2314,8 +2429,8 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (cmd === "warn") {
-        if (!canUseModCommand(member)) {
-          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can use this.", "error")], ephemeral: true });
+        if (!canUseBasicModCommand(member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Trial Moderator or higher can use this.", "error")], ephemeral: true });
           return;
         }
 
@@ -3086,7 +3201,7 @@ if (cmd === "poll") {
 
       if (interaction.customId === "claim_ticket") {
         if (!hasStaffRole(interaction.member)) {
-          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Founder, Admin, and Moderator can claim tickets.", "error")], ephemeral: true });
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Trial Moderator or higher can claim tickets.", "error")], ephemeral: true });
           return;
         }
 
@@ -3096,20 +3211,26 @@ if (cmd === "poll") {
       }
 
       if (interaction.customId === "close_ticket_button") {
+        if (!canManageTicketsCommand(interaction.member)) {
+          await interaction.reply({ embeds: [makeEmbed("No Permission", "Only staff can close tickets.", "error")], ephemeral: true });
+          return;
+        }
         if (!isTicketChannel(interaction.channel)) {
           await interaction.reply({ embeds: [makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
           return;
         }
 
         const messages = await interaction.channel.messages.fetch({ limit: 200 }).catch(() => null);
-        const lines = [...(messages?.values() || [])]
-          .reverse()
-          .map(m => `[${new Date(m.createdTimestamp).toLocaleString()}] ${m.author.tag}: ${m.content || "[embed/attachment]"}`);
-
-        await sendTranscript(interaction.guild, interaction.channel, lines);
+        const orderedMessages = [...(messages?.values() || [])].reverse();
+        await sendTranscript(interaction.guild, interaction.channel, orderedMessages, {
+          ticketOwnerId: parseTicketOwnerId(interaction.channel),
+          closedBy: interaction.user.id,
+          closeReason: "Closed via ticket button",
+          messageCount: orderedMessages.length
+        });
 
         await interaction.reply({ embeds: [makeEmbed("Closing Ticket", "This ticket will be deleted in 5 seconds.", "warn")] });
-        await sendLog(interaction.guild, "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn");
+        await sendTypedLog(interaction.guild, "moderation", "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn");
 
         setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
         return;

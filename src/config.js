@@ -2,7 +2,7 @@ module.exports = {
   timezone: "Europe/London",
   autoRole: "Player",
 
-  staffRoles: ["Founder", "Admin", "Moderator"],
+  staffRoles: ["Founder", "Admin", "Moderator", "Trial Moderator"],
 
   roles: {
     streamPing: "Stream"

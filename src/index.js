@@ -1043,6 +1043,12 @@ async function createTicket(guild, user, type, answers = null) {
   }
 
   await channel.send({
+    content: type === "support"
+      ? (() => {
+          const moderatorRole = getRoleByName(guild, "Moderator");
+          return moderatorRole ? `<@&${moderatorRole.id}>` : "";
+        })()
+      : "",
     embeds: [
       makeEmbed(
         type === "support" ? "Support Ticket Created" : "Staff Application Submitted",

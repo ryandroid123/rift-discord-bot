@@ -98,6 +98,7 @@ const autoModActionDedupe = new Map();
 const automodRecoveryDedupe = new Map();
 let afkCache = null;
 let startupCompleted = false;
+let shutdownFlushed = false;
 const AUTOMOD_WARNING_PREFIX = "AutoMod (";
 
 function logRuntimeError(label, error) {
@@ -145,6 +146,30 @@ function runDetached(label, fn) {
   });
 }
 
+function flushRuntimePersistence(reason = "runtime") {
+  if (shutdownFlushed) return;
+  shutdownFlushed = true;
+  try {
+    saveInviteCountsToState(memberInviteStats);
+  } catch (err) {
+    logRuntimeError(`flush invite counts (${reason})`, err);
+  }
+  try {
+    if (typeof featureHub.flushPersistence === "function") {
+      featureHub.flushPersistence();
+    }
+  } catch (err) {
+    logRuntimeError(`flush feature hub (${reason})`, err);
+  }
+  try {
+    if (typeof governance.flushPersistence === "function") {
+      governance.flushPersistence();
+    }
+  } catch (err) {
+    logRuntimeError(`flush governance (${reason})`, err);
+  }
+}
+
 function logChannel(guild) {
   const cfg = governance.mergeWithRuntime(config);
   return getChannelByName(guild, cfg.channels.logs);
@@ -178,11 +203,99 @@ function saveState(value) {
 }
 
 function loadGiveaways() {
-  return readJson(giveawaysPath, []);
+  const raw = readJson(giveawaysPath, []);
+  if (!Array.isArray(raw)) return [];
+  const normalized = normalizeGiveawayRecords(raw);
+  if (JSON.stringify(normalized) !== JSON.stringify(raw)) {
+    writeJson(giveawaysPath, normalized);
+  }
+  return normalized;
 }
 
 function saveGiveaways(data) {
-  writeJson(giveawaysPath, data);
+  writeJson(giveawaysPath, normalizeGiveawayRecords(Array.isArray(data) ? data : []));
+}
+
+function normalizeRoleRuleList(items) {
+  if (!Array.isArray(items)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const id = String(item?.roleId || "");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      roleId: id,
+      entries: Math.max(0, Math.min(100, Number(item.entries) || 0))
+    });
+  }
+  return out;
+}
+
+function normalizeIdList(items) {
+  if (!Array.isArray(items)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const id = String(item || "");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function normalizeGiveawayRecord(raw = {}) {
+  const entries = normalizeIdList(raw.entries || []);
+  const entryCounts = {};
+  if (raw.entryCounts && typeof raw.entryCounts === "object") {
+    for (const [userIdRaw, countRaw] of Object.entries(raw.entryCounts)) {
+      const userId = String(userIdRaw || "");
+      if (!userId) continue;
+      entryCounts[userId] = Math.max(1, Math.min(500, Number(countRaw) || 1));
+    }
+  }
+  for (const userId of entries) {
+    if (!entryCounts[userId]) entryCounts[userId] = 1;
+  }
+
+  const winnerIds = normalizeIdList(raw.winnerIds || []);
+  const winnerId = raw.winnerId ? String(raw.winnerId) : (winnerIds[0] || null);
+  if (winnerId && !winnerIds.includes(winnerId)) winnerIds.unshift(winnerId);
+
+  return {
+    messageId: String(raw.messageId || ""),
+    channelId: String(raw.channelId || ""),
+    guildId: String(raw.guildId || ""),
+    hostId: String(raw.hostId || ""),
+    prize: String(raw.prize || "Unknown prize"),
+    endsAt: Number(raw.endsAt) || Date.now(),
+    winners: Math.max(1, Math.min(25, Number(raw.winners) || 1)),
+    requiredRoleIds: normalizeIdList(raw.requiredRoleIds || []),
+    blacklistRoleIds: normalizeIdList(raw.blacklistRoleIds || []),
+    bonusEntries: normalizeRoleRuleList(raw.bonusEntries || []),
+    entries,
+    entryCounts,
+    entrySnapshots: raw.entrySnapshots && typeof raw.entrySnapshots === "object" ? raw.entrySnapshots : {},
+    ended: raw.ended === true,
+    endReason: String(raw.endReason || ""),
+    createdAt: Number(raw.createdAt) || Date.now(),
+    endedAt: Number(raw.endedAt) || null,
+    winnerId,
+    winnerIds,
+    winnerDmHistory: Array.isArray(raw.winnerDmHistory) ? raw.winnerDmHistory : [],
+    rerollHistory: Array.isArray(raw.rerollHistory) ? raw.rerollHistory : []
+  };
+}
+
+function normalizeGiveawayRecords(rows) {
+  const map = new Map();
+  for (const row of rows || []) {
+    const normalized = normalizeGiveawayRecord(row);
+    if (!normalized.messageId) continue;
+    map.set(normalized.messageId, normalized);
+  }
+  return [...map.values()];
 }
 
 function loadWarnings() {
@@ -1075,6 +1188,8 @@ function featureContext() {
     saveGiveaways,
     scheduleGiveaway,
     endGiveaway,
+    pickGiveawayWinners,
+    notifyGiveawayWinners,
     loadBackups,
     sendTranscript
   };
@@ -1392,64 +1507,159 @@ function buildInviteLeaderboard(guildId, limit = 10) {
   return rows.slice(0, Math.max(1, Math.min(25, limit)));
 }
 
+function getGiveawayEntryPool(giveaway, guild, options = {}) {
+  const excluded = new Set((options.excludeUserIds || []).map(String));
+  const pool = [];
+
+  const explicitCounts = giveaway?.entryCounts && typeof giveaway.entryCounts === "object"
+    ? giveaway.entryCounts
+    : null;
+  if (explicitCounts && Object.keys(explicitCounts).length) {
+    for (const [userIdRaw, countRaw] of Object.entries(explicitCounts)) {
+      const userId = String(userIdRaw || "");
+      if (!userId || excluded.has(userId)) continue;
+      const count = Math.max(1, Number(countRaw) || 1);
+      for (let i = 0; i < count; i += 1) pool.push(userId);
+    }
+    return pool;
+  }
+
+  for (const userIdRaw of giveaway.entries || []) {
+    const userId = String(userIdRaw || "");
+    if (!userId || excluded.has(userId)) continue;
+    let weight = 1;
+    const member = guild?.members?.cache?.get(userId);
+    for (const bonus of giveaway.bonusEntries || []) {
+      if (member?.roles?.cache?.has(bonus.roleId)) {
+        weight += Math.max(0, Number(bonus.entries) || 0);
+      }
+    }
+    for (let i = 0; i < weight; i += 1) pool.push(userId);
+  }
+  return pool;
+}
+
+function pickGiveawayWinners(giveaway, guild, options = {}) {
+  const pool = getGiveawayEntryPool(giveaway, guild, options);
+  const mutablePool = [...pool];
+  const winnerCount = Math.max(1, Number(giveaway.winners) || 1);
+  const winners = [];
+
+  while (mutablePool.length && winners.length < winnerCount) {
+    const idx = Math.floor(Math.random() * mutablePool.length);
+    const picked = mutablePool[idx];
+    winners.push(picked);
+    for (let i = mutablePool.length - 1; i >= 0; i -= 1) {
+      if (mutablePool[i] === picked) mutablePool.splice(i, 1);
+    }
+  }
+
+  return winners;
+}
+
+async function notifyGiveawayWinners(guild, giveaway, winnerIds, options = {}) {
+  const uniqueIds = [...new Set((winnerIds || []).map(String).filter(Boolean))];
+  if (!uniqueIds.length) return { sent: 0, failed: 0, failedUserIds: [] };
+
+  const results = [];
+  const channelMention = giveaway?.channelId ? `<#${giveaway.channelId}>` : "the server";
+  for (const userId of uniqueIds) {
+    try {
+      const user = await client.users.fetch(userId);
+      await user.send({
+        embeds: [makeEmbed(
+          "You Won a Giveaway",
+          `You won **${giveaway.prize}** in **${guild.name}**.\nLocation: ${channelMention}`,
+          "success",
+          [
+            { name: "Server", value: guild.name, inline: true },
+            { name: "Prize", value: giveaway.prize, inline: true },
+            { name: "Type", value: options.source === "reroll" ? "Reroll Winner" : "Giveaway Winner", inline: true }
+          ]
+        )]
+      });
+      results.push({ userId, ok: true });
+    } catch {
+      results.push({ userId, ok: false });
+    }
+  }
+
+  const sent = results.filter(x => x.ok).length;
+  const failedUserIds = results.filter(x => !x.ok).map(x => x.userId);
+  const failed = failedUserIds.length;
+
+  giveaway.winnerDmHistory = giveaway.winnerDmHistory || [];
+  giveaway.winnerDmHistory.push({
+    at: Date.now(),
+    source: options.source || "end",
+    actorId: options.actorId || null,
+    winnerIds: uniqueIds,
+    sent,
+    failed,
+    failedUserIds
+  });
+
+  return { sent, failed, failedUserIds };
+}
+
 async function endGiveaway(messageId) {
   const giveaways = loadGiveaways();
   const giveaway = giveaways.find(g => g.messageId === messageId);
   if (!giveaway || giveaway.ended) return;
 
-  const guild = client.guilds.cache.get(giveaway.guildId);
-  if (!guild) return;
-  const channel = guild.channels.cache.get(giveaway.channelId);
-  if (!channel) return;
-
-  giveaway.ended = true;
-
-  let winnerText = "No one entered.";
-  if (giveaway.entries.length) {
-    const weighted = [];
-    for (const userId of giveaway.entries) {
-      let weight = 1;
-      const member = guild.members.cache.get(userId);
-      for (const bonus of giveaway.bonusEntries || []) {
-        if (member?.roles?.cache?.has(bonus.roleId)) {
-          weight += Math.max(0, Number(bonus.entries) || 0);
-        }
-      }
-      for (let i = 0; i < weight; i += 1) weighted.push(userId);
-    }
-    const winnersWanted = Math.max(1, Number(giveaway.winners) || 1);
-    const unique = new Set();
-    for (let i = 0; i < weighted.length && unique.size < winnersWanted; i += 1) {
-      const idx = Math.floor(Math.random() * weighted.length);
-      unique.add(weighted[idx]);
-    }
-    const winners = [...unique];
-    giveaway.winnerId = winners[0] || null;
-    giveaway.winnerIds = winners;
-    winnerText = winners.map(id => `<@${id}>`).join(", ");
+  if (giveawayTimers.has(messageId)) {
+    clearTimeout(giveawayTimers.get(messageId));
+    giveawayTimers.delete(messageId);
   }
+  giveaway.ended = true;
+  giveaway.endedAt = Date.now();
+  giveaway.endReason = giveaway.endReason || "completed";
+
+  const guild = client.guilds.cache.get(giveaway.guildId);
+  const winners = guild ? pickGiveawayWinners(giveaway, guild) : [];
+  giveaway.winnerId = winners[0] || null;
+  giveaway.winnerIds = winners;
 
   saveGiveaways(giveaways);
 
-  const msg = await channel.messages.fetch(giveaway.messageId).catch(() => null);
-  if (msg) {
-    await msg.edit({
-      embeds: [makeEmbed("🎉 Giveaway Ended", `**Prize:** ${giveaway.prize}\n**Winner:** ${winnerText}`, "success")],
-      components: []
+  if (!guild) return;
+  const channel = guild.channels.cache.get(giveaway.channelId);
+  const winnerText = winners.length ? winners.map(id => `<@${id}>`).join(", ") : "No one entered.";
+
+  if (channel) {
+    const msg = await channel.messages.fetch(giveaway.messageId).catch(() => null);
+    if (msg) {
+      await msg.edit({
+        embeds: [makeEmbed("Giveaway Ended", `**Prize:** ${giveaway.prize}\n**Winner(s):** ${winnerText}`, "success")],
+        components: []
+      }).catch(() => {});
+    }
+
+    await channel.send({
+      embeds: [makeEmbed("Giveaway Finished", `**Prize:** ${giveaway.prize}\n**Winner(s):** ${winnerText}`, "success") ]
     }).catch(() => {});
   }
 
-  await channel.send({
-    embeds: [makeEmbed("Giveaway Finished", `**Prize:** ${giveaway.prize}\n**Winner:** ${winnerText}`, "success")]
-  }).catch(() => {});
+  const dmStatus = await notifyGiveawayWinners(guild, giveaway, winners, {
+    source: "end",
+    actorId: giveaway.hostId || null
+  }).catch(() => ({ sent: 0, failed: winners.length || 0, failedUserIds: winners || [] }));
+  saveGiveaways(giveaways);
 
-  await sendLog(guild, "Giveaway Ended", `Giveaway ended in ${channel}.`, "info", [
+  await sendLog(guild, "Giveaway Ended", `Giveaway ended in ${channel || "unknown channel"}.`, "info", [
     { name: "Prize", value: giveaway.prize, inline: true },
     { name: "Winner(s)", value: winnerText, inline: true },
-    { name: "Entries", value: String(giveaway.entries.length), inline: true }
+    { name: "Entries", value: String((giveaway.entries || []).length), inline: true },
+    { name: "Winner DMs", value: `Sent ${dmStatus.sent}, Failed ${dmStatus.failed}`, inline: true }
   ]);
-}
 
+  if (dmStatus.failed) {
+    await sendTypedLog(guild, "moderation", "Giveaway Winner DM Failed", `${dmStatus.failed} giveaway winner DM(s) failed.`, "warn", [
+      { name: "Giveaway", value: giveaway.messageId, inline: true },
+      { name: "Failed IDs", value: dmStatus.failedUserIds.map(id => `<@${id}>`).join(", ").slice(0, 1000) || "n/a" }
+    ]);
+  }
+}
 function scheduleGiveaway(giveaway) {
   const delay = Math.max(0, giveaway.endsAt - Date.now());
   if (giveawayTimers.has(giveaway.messageId)) {
@@ -1458,6 +1668,7 @@ function scheduleGiveaway(giveaway) {
   const timer = setTimeout(async () => {
     await endGiveaway(giveaway.messageId);
   }, delay);
+  if (typeof timer.unref === "function") timer.unref();
   giveawayTimers.set(giveaway.messageId, timer);
 }
 
@@ -1960,6 +2171,7 @@ client.once(Events.ClientReady, async () => {
       let scheduled = 0;
       let recoveredEnded = 0;
       for (const g of giveaways) {
+        if (!g.messageId) continue;
         if (g.ended) continue;
         if (typeof g.endsAt === "number" && g.endsAt <= Date.now()) {
           await endGiveaway(g.messageId).catch(() => {});
@@ -3550,11 +3762,17 @@ process.on("uncaughtException", err => {
 });
 
 process.on("SIGTERM", signal => {
+  flushRuntimePersistence(signal);
   console.warn(`[runtime] received ${signal}; process may be stopping due to platform lifecycle.`);
 });
 
 process.on("SIGINT", signal => {
+  flushRuntimePersistence(signal);
   console.warn(`[runtime] received ${signal}; shutting down signal observed.`);
+});
+
+process.on("beforeExit", () => {
+  flushRuntimePersistence("beforeExit");
 });
 
 console.log("ABOUT TO LOGIN...");

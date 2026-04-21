@@ -377,6 +377,7 @@ module.exports = [
         ]
       },
       { name: "text", type: 3, required: false, description: "Template text or image URL" },
+      { name: "image_file", type: 11, required: false, description: "Upload an image for welcome branding" },
       { name: "role", type: 8, required: false, description: "Auto-role for joins" }
     ]
   },

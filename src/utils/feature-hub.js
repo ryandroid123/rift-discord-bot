@@ -97,6 +97,14 @@ function scheduleProfilesFlush() {
   if (typeof profilesFlushTimer.unref === "function") profilesFlushTimer.unref();
 }
 
+function flushPersistence() {
+  if (profilesFlushTimer) {
+    clearTimeout(profilesFlushTimer);
+    profilesFlushTimer = null;
+  }
+  flushProfilesNow();
+}
+
 function ensureGuild(data, guildId, fallback = {}) {
   if (!data[guildId]) data[guildId] = fallback;
   return data[guildId];
@@ -209,6 +217,8 @@ function isInMaintenance(interaction, ctx) {
 }
 
 function formatGiveawaySummary(g) {
+  const explicitCounts = Object.values(g.entryCounts || {}).reduce((sum, n) => sum + Math.max(1, Number(n) || 1), 0);
+  const totalEntries = explicitCounts || (g.entries || []).length;
   const req = (g.requiredRoleIds || []).map(id => `<@&${id}>`).join(", ") || "None";
   const blk = (g.blacklistRoleIds || []).map(id => `<@&${id}>`).join(", ") || "None";
   const bonus = (g.bonusEntries || []).map(b => `<@&${b.roleId}> (+${b.entries})`).join("\n") || "None";
@@ -216,16 +226,33 @@ function formatGiveawaySummary(g) {
     `**Prize:** ${g.prize}`,
     `**Ends:** <t:${Math.floor(g.endsAt / 1000)}:R>`,
     `**Winners:** ${g.winners || 1}`,
-    `**Entries:** ${g.entries.length}`,
+    `**Entries:** ${totalEntries} total from ${(g.entries || []).length} participant(s)`,
     `**Required Roles:** ${req}`,
     `**Blacklisted Roles:** ${blk}`,
     `**Bonus Entries:** ${bonus}`
   ].join("\n");
 }
 
-function buildWeightedPool(giveaway, guild) {
+function buildWeightedPool(giveaway, guild, options = {}) {
+  const excluded = new Set((options.excludeUserIds || []).map(String));
   const pool = [];
-  for (const userId of giveaway.entries || []) {
+  const explicitCounts = giveaway.entryCounts && typeof giveaway.entryCounts === "object"
+    ? giveaway.entryCounts
+    : null;
+
+  if (explicitCounts && Object.keys(explicitCounts).length) {
+    for (const [userIdRaw, countRaw] of Object.entries(explicitCounts)) {
+      const userId = String(userIdRaw || "");
+      if (!userId || excluded.has(userId)) continue;
+      const count = Math.max(1, Number(countRaw) || 1);
+      for (let i = 0; i < count; i += 1) pool.push(userId);
+    }
+    return pool;
+  }
+
+  for (const userIdRaw of giveaway.entries || []) {
+    const userId = String(userIdRaw || "");
+    if (!userId || excluded.has(userId)) continue;
     let weight = 1;
     const member = guild.members.cache.get(userId);
     for (const bonus of giveaway.bonusEntries || []) {
@@ -238,15 +265,21 @@ function buildWeightedPool(giveaway, guild) {
   return pool;
 }
 
-function pickWinners(giveaway, guild) {
-  const pool = buildWeightedPool(giveaway, guild);
-  const unique = new Set();
+function pickWinners(giveaway, guild, options = {}) {
+  const pool = buildWeightedPool(giveaway, guild, options);
+  const mutablePool = [...pool];
+  const winners = [];
   const winnerCount = Math.max(1, Number(giveaway.winners) || 1);
-  for (let i = 0; i < pool.length && unique.size < winnerCount; i += 1) {
-    const idx = Math.floor(Math.random() * pool.length);
-    unique.add(pool[idx]);
+
+  while (mutablePool.length && winners.length < winnerCount) {
+    const idx = Math.floor(Math.random() * mutablePool.length);
+    const picked = mutablePool[idx];
+    winners.push(picked);
+    for (let i = mutablePool.length - 1; i >= 0; i -= 1) {
+      if (mutablePool[i] === picked) mutablePool.splice(i, 1);
+    }
   }
-  return [...unique];
+  return winners;
 }
 
 async function maybeRunReminders(client, ctx) {
@@ -459,6 +492,8 @@ async function handleMemberAdd(member, ctx) {
   }
 
   const msgTemplate = settings.welcome?.customMessage || "Welcome {user} to **{server}**!";
+  const brandName = settings.welcome?.brandName || "Rift Studios";
+  const welcomeImage = settings.welcome?.welcomeImage || process.env.RIFT_WELCOME_IMAGE_URL || null;
   const welcomeText = msgTemplate
     .replace(/\{user\}/g, `${member}`)
     .replace(/\{userTag\}/g, member.user.tag)
@@ -467,12 +502,22 @@ async function handleMemberAdd(member, ctx) {
 
   const landing = ctx.getChannelByName(member.guild, ctx.currentConfig().channels.landing);
   if (landing?.isTextBased?.()) {
-    await landing.send({ embeds: [ctx.makeEmbed(returning ? "Welcome Back" : "Welcome", welcomeText, "success")] }).catch(() => {});
+    const embed = ctx.makeEmbed(
+      returning ? `Welcome Back to ${brandName}` : `Welcome to ${brandName}`,
+      welcomeText,
+      "success",
+      [
+        { name: "Member", value: `${member.user.tag}`, inline: true },
+        { name: "Join Count", value: String(p.joins || 1), inline: true }
+      ]
+    );
+    if (welcomeImage) embed.image = { url: welcomeImage };
+    if (member.guild.iconURL?.()) embed.thumbnail = { url: member.guild.iconURL({ extension: "png", size: 256 }) };
+    embed.footer = { text: `${brandName} | Welcome` };
+
+    await landing.send({ content: `${member}`, embeds: [embed] }).catch(() => {});
     if (settings.welcome?.onboardingPrompt) {
       await landing.send({ content: `${member} ${settings.welcome.onboardingPrompt}` }).catch(() => {});
-    }
-    if (settings.welcome?.welcomeImage) {
-      await landing.send({ content: settings.welcome.welcomeImage }).catch(() => {});
     }
   }
 
@@ -557,6 +602,12 @@ async function handleGiveawayJoin(interaction, ctx) {
   const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
   if (!member) return true;
 
+  if (Number(giveaway.endsAt || 0) > 0 && Number(giveaway.endsAt) <= Date.now()) {
+    await ctx.endGiveaway(giveaway.messageId).catch(() => {});
+    await interaction.reply({ embeds: [ctx.makeEmbed("Giveaway Ended", "This giveaway has already ended.", "warn")], ephemeral: true });
+    return true;
+  }
+
   for (const roleId of giveaway.requiredRoleIds || []) {
     if (!member.roles.cache.has(roleId)) {
       await interaction.reply({ embeds: [ctx.makeEmbed("Requirement Missing", `You need <@&${roleId}> to join this giveaway.`, "warn")], ephemeral: true });
@@ -576,6 +627,19 @@ async function handleGiveawayJoin(interaction, ctx) {
   }
 
   giveaway.entries.push(interaction.user.id);
+  giveaway.entryCounts = giveaway.entryCounts || {};
+  giveaway.entrySnapshots = giveaway.entrySnapshots || {};
+  let totalEntries = 1;
+  for (const bonus of giveaway.bonusEntries || []) {
+    if (member.roles.cache.has(bonus.roleId)) {
+      totalEntries += Math.max(0, Number(bonus.entries) || 0);
+    }
+  }
+  giveaway.entryCounts[interaction.user.id] = Math.max(1, totalEntries);
+  giveaway.entrySnapshots[interaction.user.id] = {
+    joinedAt: Date.now(),
+    entries: giveaway.entryCounts[interaction.user.id]
+  };
   ctx.saveGiveaways(giveaways);
 
   const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
@@ -586,7 +650,7 @@ async function handleGiveawayJoin(interaction, ctx) {
     }).catch(() => {});
   }
 
-  await interaction.reply({ embeds: [ctx.makeEmbed("Entry Confirmed", "You joined the giveaway.", "success")], ephemeral: true });
+  await interaction.reply({ embeds: [ctx.makeEmbed("Entry Confirmed", `You joined the giveaway with **${Math.max(1, totalEntries)}** entr${totalEntries === 1 ? "y" : "ies"}.`, "success")], ephemeral: true });
   return true;
 }
 
@@ -652,7 +716,10 @@ async function handleCommand(interaction, ctx) {
       blacklistRoleIds: blacklistRole ? [blacklistRole.id] : [],
       bonusEntries: bonusRole && bonusEntries > 0 ? [{ roleId: bonusRole.id, entries: bonusEntries }] : [],
       entries: [],
+      entryCounts: {},
+      entrySnapshots: {},
       ended: false,
+      createdAt: Date.now(),
       winnerId: null,
       winnerIds: [],
       rerollHistory: []
@@ -698,21 +765,41 @@ async function handleCommand(interaction, ctx) {
       return true;
     }
 
-    const winners = pickWinners(giveaway, interaction.guild);
+    if (!giveaway.ended) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Giveaway Active", "End the giveaway before rerolling so results stay fair.", "warn")], ephemeral: true });
+      return true;
+    }
+
+    const previousWinners = new Set((giveaway.winnerIds || []).map(String));
+    let winners = typeof ctx.pickGiveawayWinners === "function"
+      ? ctx.pickGiveawayWinners(giveaway, interaction.guild, { excludeUserIds: [...previousWinners] })
+      : pickWinners(giveaway, interaction.guild, { excludeUserIds: [...previousWinners] });
+    if (!winners.length) {
+      winners = typeof ctx.pickGiveawayWinners === "function"
+        ? ctx.pickGiveawayWinners(giveaway, interaction.guild)
+        : pickWinners(giveaway, interaction.guild);
+    }
+
     giveaway.winnerIds = winners;
     giveaway.winnerId = winners[0] || null;
     giveaway.rerollHistory = giveaway.rerollHistory || [];
-    giveaway.rerollHistory.push({ by: interaction.user.id, at: Date.now(), winners });
+    giveaway.rerollHistory.push({ by: interaction.user.id, at: Date.now(), winners, previousWinners: [...previousWinners] });
     ctx.saveGiveaways(giveaways);
 
     await interaction.channel.send({
-      embeds: [ctx.makeEmbed("🎉 Giveaway Rerolled", `Winners: ${winners.map(id => `<@${id}>`).join(", ") || "none"}`, "success")]
+      embeds: [ctx.makeEmbed("Giveaway Rerolled", `Winners: ${winners.map(id => `<@${id}>`).join(", ") || "none"}`, "success")]
     });
+    if (typeof ctx.notifyGiveawayWinners === "function") {
+      await ctx.notifyGiveawayWinners(interaction.guild, giveaway, winners, {
+        source: "reroll",
+        actorId: interaction.user.id
+      }).catch(() => {});
+      ctx.saveGiveaways(giveaways);
+    }
     await interaction.reply({ embeds: [ctx.makeEmbed("Rerolled", "New winners selected.", "success")], ephemeral: true });
     await ctx.sendTypedLog(interaction.guild, "moderation", "Giveaway Reroll", `${interaction.user.tag} rerolled giveaway ${messageId}.`, "info");
     return true;
   }
-
   if (cmd === "giveawaymanage") {
     if (!ctx.canUseModCommand(interaction.member)) {
       await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can manage giveaways.", "error")], ephemeral: true });
@@ -830,6 +917,7 @@ async function handleCommand(interaction, ctx) {
     }
     const action = interaction.options.getString("action");
     const text = interaction.options.getString("text");
+    const imageFile = interaction.options.getAttachment ? interaction.options.getAttachment("image_file") : null;
     const role = interaction.options.getRole("role");
 
     if (action === "show") {
@@ -854,7 +942,10 @@ async function handleCommand(interaction, ctx) {
       g.leave = g.leave || {};
       if (action === "set" && text) g.welcome.customMessage = text;
       if (action === "dm" && text) g.welcome.dmMessage = text;
-      if (action === "image") g.welcome.welcomeImage = text || null;
+      if (action === "image") {
+        g.welcome.welcomeImage = imageFile?.url || text || null;
+        g.welcome.brandName = g.welcome.brandName || "Rift Studios";
+      }
       if (action === "leave" && text) g.leave.message = text;
       if (action === "autorole" && role) {
         g.welcome.autoRoles = g.welcome.autoRoles || [];
@@ -1766,6 +1857,7 @@ async function handleModal() {
 
 module.exports = {
   onReady,
+  flushPersistence,
   handleCommand,
   handleButton,
   handleModal,

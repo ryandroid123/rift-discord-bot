@@ -237,6 +237,17 @@ function incrementAnalytics(guildId, key, amount = 1) {
   if (typeof analyticsFlushTimer.unref === "function") analyticsFlushTimer.unref();
 }
 
+function flushPersistence() {
+  if (analyticsFlushTimer) {
+    clearTimeout(analyticsFlushTimer);
+    analyticsFlushTimer = null;
+  }
+  if (!analyticsDirtyGuilds.size || !analyticsCache) return false;
+  writeJson(analyticsPath, analyticsCache);
+  analyticsDirtyGuilds.clear();
+  return true;
+}
+
 function getAnalytics(guildId) {
   if (!analyticsCache) analyticsCache = readJson(analyticsPath, {});
   return analyticsCache[guildId] || {};
@@ -283,6 +294,7 @@ module.exports = {
   getRisk,
   decayRiskAll,
   incrementAnalytics,
+  flushPersistence,
   getAnalytics,
   getLockdownState,
   setLockdownState,

@@ -65,6 +65,8 @@ for (const file of Object.values(DATA_FILES)) {
 const xpCooldown = new Map();
 const selfbotWindow = new Map();
 const stickyCooldown = new Map();
+const ticketOpenBurstGuard = new Map();
+const ticketDeleteInFlight = new Map();
 let profilesCache = null;
 let profilesDirty = false;
 let profilesFlushTimer = null;
@@ -77,6 +79,62 @@ function load(name, fallback) {
 function save(name, value) {
   const file = DATA_FILES[name];
   writeJson(resolveDataPath(file), value);
+}
+
+function shouldBlockTicketOpenBurst(guildId, userId, type, windowMs = 5000) {
+  const now = Date.now();
+  const key = `${guildId}:${userId}:${String(type || "").toLowerCase()}`;
+  const last = ticketOpenBurstGuard.get(key) || 0;
+  ticketOpenBurstGuard.set(key, now);
+  for (const [k, t] of ticketOpenBurstGuard.entries()) {
+    if (now - t > Math.max(30000, windowMs * 4)) ticketOpenBurstGuard.delete(k);
+  }
+  return now - last < windowMs;
+}
+
+function buildApplicationModal() {
+  const modal = new ModalBuilder()
+    .setCustomId("staff_application_modal")
+    .setTitle("Staff Application");
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("age")
+        .setLabel("How old are you?")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("timezone")
+        .setLabel("What is your timezone?")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("experience")
+        .setLabel("Do you have staff experience?")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("availability")
+        .setLabel("What is your availability?")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false)
+        .setPlaceholder("Days/times you can be active")
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("why")
+        .setLabel("Why do you want to be staff?")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+    )
+  );
+  return modal;
 }
 
 function getProfilesData() {
@@ -420,12 +478,97 @@ function buildTicketControls(meta) {
     new ButtonBuilder().setCustomId("claim_ticket").setLabel("Claim Ticket").setStyle(ButtonStyle.Primary).setDisabled(isClosed),
     new ButtonBuilder().setCustomId("unclaim_ticket").setLabel("Unclaim").setStyle(ButtonStyle.Secondary).setDisabled(isClosed),
     new ButtonBuilder().setCustomId("close_ticket_button").setLabel("Close Ticket").setStyle(ButtonStyle.Danger).setDisabled(isClosed),
-    new ButtonBuilder().setCustomId("reopen_ticket").setLabel("Reopen Ticket").setStyle(ButtonStyle.Success).setDisabled(!isClosed)
+    new ButtonBuilder().setCustomId("reopen_ticket").setLabel("Reopen Ticket").setStyle(ButtonStyle.Success).setDisabled(!isClosed),
+    new ButtonBuilder().setCustomId("delete_ticket_button").setLabel("Delete Ticket").setStyle(ButtonStyle.Danger).setDisabled(!isClosed)
   );
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("ticket_priority_cycle").setLabel(priorityLabel).setStyle(ButtonStyle.Secondary).setDisabled(isClosed)
   );
   return [row, row2];
+}
+
+function hasTicketTranscript(index, guildId, channelId) {
+  return index.some(x => x.guildId === guildId && x.channelId === channelId);
+}
+
+async function ensureTranscriptBeforeDelete(interaction, ctx, meta, source = "delete-button") {
+  const index = load("transcriptIndex", []);
+  const alreadySaved = hasTicketTranscript(index, interaction.guild.id, interaction.channel.id);
+  if (alreadySaved) return false;
+
+  const messages = await interaction.channel.messages.fetch({ limit: 250 }).catch(() => null);
+  const orderedMessages = [...(messages?.values() || [])].reverse();
+  const transcriptInfo = await ctx.sendTranscript(interaction.guild, interaction.channel, orderedMessages, {
+    ticketOwnerId: meta.ownerId || null,
+    ticketType: meta.ticketType || "support",
+    ticketStatus: meta.status || "closed",
+    priority: meta.priority || "normal",
+    claimedBy: meta.claimedBy || null,
+    closedBy: meta.closedBy || interaction.user.id,
+    closeReason: meta.closeReason || "No reason provided",
+    messageCount: orderedMessages.length
+  });
+
+  index.push({
+    guildId: interaction.guild.id,
+    channelId: interaction.channel.id,
+    channelName: interaction.channel.name,
+    ticketOwnerId: meta.ownerId || null,
+    ticketType: meta.ticketType || "support",
+    status: meta.status || "closed",
+    priority: meta.priority || "normal",
+    claimedBy: meta.claimedBy || null,
+    time: Date.now(),
+    closedBy: meta.closedBy || interaction.user.id,
+    reason: meta.closeReason || "Deleted after closure",
+    source,
+    transcriptFile: transcriptInfo?.fileName || null,
+    preview: orderedMessages.map(m => m.content || "").join(" ").slice(0, 350)
+  });
+  save("transcriptIndex", index.slice(-5000));
+  return true;
+}
+
+async function deleteClosedTicket(interaction, ctx, source = "delete-button-confirm") {
+  if (!ctx.isTicketChannel(interaction.channel)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+    return true;
+  }
+
+  const all = load("ticketMeta", {});
+  const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+  if (meta.status !== "closed") {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Close First", "Close the ticket before deleting it.", "warn")], ephemeral: true });
+    return true;
+  }
+
+  const inflightKey = `${interaction.guild.id}:${interaction.channel.id}`;
+  if (ticketDeleteInFlight.has(inflightKey)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Please Wait", "Ticket deletion is already in progress.", "info")], ephemeral: true });
+    return true;
+  }
+  ticketDeleteInFlight.set(inflightKey, Date.now());
+
+  try {
+    const createdTranscript = await ensureTranscriptBeforeDelete(interaction, ctx, meta, source);
+    const now = Date.now();
+    meta.deletedAt = now;
+    meta.deletedBy = interaction.user.id;
+    meta.actionHistory.push({ action: "delete", by: interaction.user.id, at: now, source, transcriptCreated: createdTranscript });
+    save("ticketMeta", all);
+
+    await interaction.reply({ embeds: [ctx.makeEmbed("Deleting Ticket", "Ticket will be deleted in 4 seconds.", "warn")] });
+    await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Deleted", `${interaction.user.tag} deleted ${interaction.channel.name}.`, "warn", [
+      { name: "Status", value: String(meta.status || "closed").toUpperCase(), inline: true },
+      { name: "Priority", value: formatTicketPriority(meta.priority), inline: true },
+      { name: "Transcript", value: createdTranscript ? "Saved before delete" : "Already saved", inline: true }
+    ]);
+
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 4000);
+    return true;
+  } finally {
+    setTimeout(() => ticketDeleteInFlight.delete(inflightKey), 10000);
+  }
 }
 
 function buildTicketStatusEmbed(ctx, interaction, meta) {
@@ -2258,6 +2401,29 @@ async function handleButton(interaction, ctx) {
     return true;
   }
 
+  if (interaction.customId === "open_support_ticket") {
+    if (typeof ctx.createTicket !== "function") return false;
+    if (shouldBlockTicketOpenBurst(interaction.guild.id, interaction.user.id, "support")) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Please Wait", "Your ticket request is already being processed.", "info")], ephemeral: true });
+      return true;
+    }
+    const result = await ctx.createTicket(interaction.guild, interaction.user, "support");
+    await interaction.reply({
+      embeds: [ctx.makeEmbed(result.exists ? "Ticket Already Open" : "Support Ticket Opened", `${result.channel}`, result.exists ? "warn" : "success")],
+      ephemeral: true
+    });
+    return true;
+  }
+
+  if (interaction.customId === "open_application_ticket") {
+    if (shouldBlockTicketOpenBurst(interaction.guild.id, interaction.user.id, "application-modal")) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Please Wait", "Your application form is already opening.", "info")], ephemeral: true });
+      return true;
+    }
+    await interaction.showModal(buildApplicationModal());
+    return true;
+  }
+
   if (interaction.customId === "claim_ticket") {
     const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
       ? ctx.canManageTicketsCommand(interaction.member)
@@ -2336,11 +2502,120 @@ async function handleButton(interaction, ctx) {
     return true;
   }
 
+  if (interaction.customId === "delete_ticket_button") {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can delete tickets.", "error")], ephemeral: true });
+      return true;
+    }
+    if (!ctx.isTicketChannel(interaction.channel)) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+      return true;
+    }
+    const all = load("ticketMeta", {});
+    const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+    if (meta.status !== "closed") {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Close First", "Close the ticket before deleting it.", "warn")], ephemeral: true });
+      return true;
+    }
+    const confirmRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`confirm_delete_ticket:${interaction.channel.id}`).setLabel("Confirm Delete").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`cancel_delete_ticket:${interaction.channel.id}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+    );
+    await interaction.reply({
+      embeds: [ctx.makeEmbed("Confirm Ticket Deletion", "This will permanently delete the closed ticket channel.\nA transcript will be saved first if missing.", "warn")],
+      components: [confirmRow],
+      ephemeral: true
+    });
+    return true;
+  }
+
+  if (interaction.customId.startsWith("cancel_delete_ticket:")) {
+    await interaction.update({
+      embeds: [ctx.makeEmbed("Deletion Cancelled", "Ticket deletion was cancelled.", "info")],
+      components: []
+    });
+    return true;
+  }
+
+  if (interaction.customId.startsWith("confirm_delete_ticket:")) {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can delete tickets.", "error")], ephemeral: true });
+      return true;
+    }
+    const channelId = interaction.customId.split(":")[1];
+    if (channelId && interaction.channel?.id !== channelId) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Stale Confirmation", "Please use the delete button in the current ticket.", "warn")], ephemeral: true });
+      return true;
+    }
+    return deleteClosedTicket(interaction, ctx, "delete-button-confirm");
+  }
+
   return false;
 }
 
 async function handleModal(interaction, ctx) {
   if (!interaction.isModalSubmit()) return false;
+  if (interaction.customId === "staff_application_modal") {
+    if (typeof ctx.createTicket !== "function") return false;
+    const age = String(interaction.fields.getTextInputValue("age") || "").trim();
+    const timezone = String(interaction.fields.getTextInputValue("timezone") || "").trim();
+    const experience = String(interaction.fields.getTextInputValue("experience") || "").trim();
+    const availability = String(interaction.fields.getTextInputValue("availability") || "").trim() || "Not provided";
+    const why = String(interaction.fields.getTextInputValue("why") || "").trim();
+
+    const appId = `APP-${Date.now().toString(36)}`;
+    const answersText = [
+      `Age: ${age}`,
+      `Timezone: ${timezone}`,
+      `Experience: ${experience}`,
+      `Availability: ${availability}`,
+      `Why: ${why}`
+    ].join("\n");
+
+    const all = load("applications", []);
+    all.push({
+      id: appId,
+      guildId: interaction.guild.id,
+      userId: interaction.user.id,
+      type: "staff-ticket",
+      answers: answersText,
+      answersMap: { age, timezone, experience, availability, why },
+      status: "pending",
+      reviewedBy: null,
+      note: null,
+      createdAt: Date.now(),
+      reviewedAt: null,
+      source: "ticket-modal"
+    });
+    save("applications", all);
+
+    const result = await ctx.createTicket(interaction.guild, interaction.user, "application", {
+      age,
+      timezone,
+      experience,
+      availability,
+      why,
+      applicationId: appId
+    });
+
+    await interaction.reply({
+      embeds: [ctx.makeEmbed(result.exists ? "Application Already Open" : "Application Submitted", `${result.channel}\nApplication ID: \`${appId}\``, result.exists ? "warn" : "success")],
+      ephemeral: true
+    });
+
+    await ctx.sendTypedLog(interaction.guild, "member", "Application Submitted", `${interaction.user.tag} submitted a staff application via ticket modal.`, "info", [
+      { name: "Application ID", value: appId, inline: true },
+      { name: "Channel", value: `${result.channel}`, inline: true }
+    ]);
+    return true;
+  }
+
   if (interaction.customId === "ticket_close_reason_modal") {
     const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
       ? ctx.canManageTicketsCommand(interaction.member)

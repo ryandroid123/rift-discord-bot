@@ -19,9 +19,6 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
   AuditLogEvent
 } = require("discord.js");
 
@@ -98,6 +95,7 @@ const antiNukeDedupe = new Map();
 const coordinatedSpamCache = new Map();
 const autoModActionDedupe = new Map();
 const automodRecoveryDedupe = new Map();
+const ticketCreateInFlight = new Map();
 let afkCache = null;
 let startupCompleted = false;
 let shutdownFlushed = false;
@@ -1193,7 +1191,8 @@ function featureContext() {
     pickGiveawayWinners,
     notifyGiveawayWinners,
     loadBackups,
-    sendTranscript
+    sendTranscript,
+    createTicket
   };
 }
 
@@ -1240,6 +1239,14 @@ function parseTicketType(channel) {
   const topic = String(channel?.topic || "");
   const m = topic.match(/type:([a-z-]+)/i);
   return m ? String(m[1]).toLowerCase() : "unknown";
+}
+
+function findExistingTicketChannel(guild, categoryId, ownerId, type, channelName) {
+  return guild.channels.cache.find(c => {
+    if (c.parentId !== categoryId) return false;
+    if (c.name === channelName) return true;
+    return parseTicketOwnerId(c) === ownerId && parseTicketType(c) === type;
+  }) || null;
 }
 
 function formatTranscriptMessage(message) {
@@ -1378,98 +1385,114 @@ function buildTicketOverwrites(guild, userId) {
 }
 
 async function createTicket(guild, user, type, answers = null) {
-  const category = await createTicketsCategoryIfMissing(guild);
-  const safe = user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12) || "user";
-  const channelName = type === "support" ? `support-${safe}` : `application-${safe}`;
+  const key = `${guild.id}:${user.id}:${String(type || "").toLowerCase()}`;
+  if (ticketCreateInFlight.has(key)) {
+    return ticketCreateInFlight.get(key);
+  }
 
-  const existing = guild.channels.cache.find(c => c.parentId === category.id && c.name === channelName);
-  if (existing) return { channel: existing, exists: true };
+  const task = (async () => {
+    const category = await createTicketsCategoryIfMissing(guild);
+    const safe = user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12) || "user";
+    const channelName = type === "support" ? `support-${safe}` : `application-${safe}`;
 
-  const channel = await guild.channels.create({
-    name: channelName,
-    type: ChannelType.GuildText,
-    parent: category.id,
-    topic: `owner:${user.id};type:${type}`,
-    permissionOverwrites: buildTicketOverwrites(guild, user.id)
-  });
+    const existing = findExistingTicketChannel(guild, category.id, user.id, type, channelName);
+    if (existing) return { channel: existing, exists: true };
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("claim_ticket").setLabel("Claim Ticket").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("unclaim_ticket").setLabel("Unclaim").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("close_ticket_button").setLabel("Close Ticket").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("reopen_ticket").setLabel("Reopen Ticket").setStyle(ButtonStyle.Success).setDisabled(true)
-  );
-  const priorityRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("ticket_priority_cycle").setLabel("Priority: Normal").setStyle(ButtonStyle.Secondary)
-  );
+    const channel = await guild.channels.create({
+      name: channelName,
+      type: ChannelType.GuildText,
+      parent: category.id,
+      topic: `owner:${user.id};type:${type}`,
+      permissionOverwrites: buildTicketOverwrites(guild, user.id)
+    });
 
-  const fields = [
-    { name: "Opened By", value: user.tag, inline: true },
-    { name: "Type", value: type === "support" ? "Support" : "Staff Application", inline: true },
-    { name: "Status", value: "Open", inline: true },
-    { name: "Priority", value: "Normal", inline: true },
-    { name: "Claimed By", value: "Unclaimed", inline: true }
-  ];
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("claim_ticket").setLabel("Claim Ticket").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("unclaim_ticket").setLabel("Unclaim").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("close_ticket_button").setLabel("Close Ticket").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("reopen_ticket").setLabel("Reopen Ticket").setStyle(ButtonStyle.Success).setDisabled(true)
+    );
+    const priorityRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("ticket_priority_cycle").setLabel("Priority: Normal").setStyle(ButtonStyle.Secondary)
+    );
+
+    const fields = [
+      { name: "Opened By", value: user.tag, inline: true },
+      { name: "Type", value: type === "support" ? "Support" : "Staff Application", inline: true },
+      { name: "Status", value: "Open", inline: true },
+      { name: "Priority", value: "Normal", inline: true },
+      { name: "Claimed By", value: "Unclaimed", inline: true }
+    ];
 
   if (answers) {
     fields.push(
       { name: "Age", value: answers.age },
       { name: "Timezone", value: answers.timezone },
       { name: "Experience", value: answers.experience },
+      { name: "Availability", value: answers.availability || "Not provided" },
       { name: "Why", value: answers.why }
     );
+    if (answers.applicationId) {
+      fields.push({ name: "Application ID", value: answers.applicationId, inline: true });
+    }
   }
 
-  const staffPing = type === "support"
-    ? getStaffRoles(guild)
-      .filter(r => ["Head Moderator", "Moderator", "Trial Moderator"].includes(r.name))
-      .map(r => `<@&${r.id}>`)
-      .join(" ")
-    : "";
+    const staffPing = type === "support"
+      ? getStaffRoles(guild)
+        .filter(r => ["Head Moderator", "Moderator", "Trial Moderator"].includes(r.name))
+        .map(r => `<@&${r.id}>`)
+        .join(" ")
+      : "";
 
-  const panel = await channel.send({
-    content: type === "support"
-      ? staffPing
-      : "",
-    embeds: [
-      makeEmbed(
-        type === "support" ? "Support Ticket Created" : "Staff Application Submitted",
-        `${user}\n\n${
-          type === "support"
-            ? "Please explain your issue clearly. Staff will reply soon."
-            : "Your application has been submitted for review."
-        }`,
-        "info",
-        fields
-      )
-    ],
-    components: [row, priorityRow]
-  });
+    const panel = await channel.send({
+      content: type === "support" ? staffPing : "",
+      embeds: [
+        makeEmbed(
+          type === "support" ? "Support Ticket Created" : "Staff Application Submitted",
+          `${user}\n\n${
+            type === "support"
+              ? "Please explain your issue clearly. Staff will reply soon."
+              : "Your application has been submitted for review."
+          }`,
+          "info",
+          fields
+        )
+      ],
+      components: [row, priorityRow]
+    });
 
-  const allTicketMeta = readJson(ticketMetaPath, {});
-  if (!allTicketMeta[guild.id]) allTicketMeta[guild.id] = {};
-  allTicketMeta[guild.id][channel.id] = {
-    claimedBy: null,
-    claimedAt: null,
-    claimHistory: [],
-    notes: [],
-    closeHistory: [],
-    reopenHistory: [],
-    status: "open",
-    priority: "normal",
-    ownerId: user.id,
-    ticketType: type,
-    openedAt: Date.now(),
-    panelMessageId: panel.id,
-    actionHistory: [{ action: "opened", by: user.id, at: Date.now(), source: "create-ticket" }]
-  };
-  writeJson(ticketMetaPath, allTicketMeta);
+    const allTicketMeta = readJson(ticketMetaPath, {});
+    if (!allTicketMeta[guild.id]) allTicketMeta[guild.id] = {};
+    allTicketMeta[guild.id][channel.id] = {
+      claimedBy: null,
+      claimedAt: null,
+      claimHistory: [],
+      notes: [],
+      closeHistory: [],
+      reopenHistory: [],
+      status: "open",
+      priority: "normal",
+      ownerId: user.id,
+      ticketType: type,
+      openedAt: Date.now(),
+      panelMessageId: panel.id,
+      actionHistory: [{ action: "opened", by: user.id, at: Date.now(), source: "create-ticket" }]
+    };
+    writeJson(ticketMetaPath, allTicketMeta);
 
-  await sendLog(guild, "Ticket Opened", `${user.tag} opened a ${type} ticket.`, "success", [
-    { name: "Channel", value: `${channel}` }
-  ]);
+    await sendLog(guild, "Ticket Opened", `${user.tag} opened a ${type} ticket.`, "success", [
+      { name: "Channel", value: `${channel}` }
+    ]);
 
-  return { channel, exists: false };
+    return { channel, exists: false };
+  })();
+
+  ticketCreateInFlight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    ticketCreateInFlight.delete(key);
+  }
 }
 
 async function ensureRulesMessage(guild) {
@@ -3660,40 +3683,6 @@ if (cmd === "poll") {
         return;
       }
 
-      if (interaction.customId === "open_support_ticket") {
-        const result = await createTicket(interaction.guild, interaction.user, "support");
-
-        await interaction.reply({
-          embeds: [makeEmbed(result.exists ? "Ticket Already Open" : "Support Ticket Opened", `${result.channel}`, result.exists ? "warn" : "success")],
-          ephemeral: true
-        });
-        return;
-      }
-
-      if (interaction.customId === "open_application_ticket") {
-        const modal = new ModalBuilder()
-          .setCustomId("staff_application_modal")
-          .setTitle("Staff Application");
-
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId("age").setLabel("How old are you?").setStyle(TextInputStyle.Short).setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId("timezone").setLabel("What is your timezone?").setStyle(TextInputStyle.Short).setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId("experience").setLabel("Do you have staff experience?").setStyle(TextInputStyle.Paragraph).setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId("why").setLabel("Why do you want to be staff?").setStyle(TextInputStyle.Paragraph).setRequired(true)
-          )
-        );
-
-        await interaction.showModal(modal);
-        return;
-      }
-
       if (interaction.customId === "claim_ticket") {
         if (!canManageTicketsCommand(interaction.member)) {
           await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Trial Moderator or higher can claim tickets.", "error")], ephemeral: true });
@@ -3772,19 +3761,6 @@ if (cmd === "poll") {
       }
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === "staff_application_modal") {
-      const result = await createTicket(interaction.guild, interaction.user, "application", {
-        age: interaction.fields.getTextInputValue("age"),
-        timezone: interaction.fields.getTextInputValue("timezone"),
-        experience: interaction.fields.getTextInputValue("experience"),
-        why: interaction.fields.getTextInputValue("why")
-      });
-
-      await interaction.reply({
-        embeds: [makeEmbed(result.exists ? "Application Already Open" : "Application Submitted", `${result.channel}`, result.exists ? "warn" : "success")],
-        ephemeral: true
-      });
-    }
   } catch (err) {
     console.error("INTERACTION ERROR:", err);
     if (!interaction.replied && !interaction.deferred) {

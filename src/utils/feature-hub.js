@@ -355,6 +355,75 @@ function checkScamPattern(message, settings) {
   return null;
 }
 
+function canForceTicketReclaim(member) {
+  if (!member?.roles?.cache) return false;
+  return member.roles.cache.some(role => ["Founder", "Admin", "Head Moderator"].includes(role.name));
+}
+
+async function claimTicket(interaction, ctx, source = "unknown") {
+  if (!ctx.isTicketChannel(interaction.channel)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+    return true;
+  }
+
+  const all = load("ticketMeta", {});
+  if (!all[interaction.guild.id]) all[interaction.guild.id] = {};
+  all[interaction.guild.id][interaction.channel.id] = all[interaction.guild.id][interaction.channel.id] || {
+    claimedBy: null,
+    claimedAt: null,
+    claimHistory: [],
+    notes: [],
+    closeHistory: []
+  };
+  const meta = all[interaction.guild.id][interaction.channel.id];
+  if (!Array.isArray(meta.claimHistory)) meta.claimHistory = [];
+
+  const previousClaimedBy = meta.claimedBy || null;
+  if (previousClaimedBy === interaction.user.id) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Already Claimed", "You already claimed this ticket.", "info")], ephemeral: true });
+    return true;
+  }
+
+  if (previousClaimedBy && previousClaimedBy !== interaction.user.id && !canForceTicketReclaim(interaction.member)) {
+    await interaction.reply({
+      embeds: [ctx.makeEmbed("Already Claimed", `This ticket is already claimed by <@${previousClaimedBy}>. Ask a Head Moderator+ to reassign it.`, "warn")],
+      ephemeral: true
+    });
+    return true;
+  }
+
+  const now = Date.now();
+  meta.claimedBy = interaction.user.id;
+  meta.claimedAt = now;
+  meta.claimHistory.push({
+    by: interaction.user.id,
+    from: previousClaimedBy,
+    at: now,
+    source
+  });
+  save("ticketMeta", all);
+  bumpStaffActivity(interaction.guild.id, interaction.user.id);
+
+  if (previousClaimedBy && previousClaimedBy !== interaction.user.id) {
+    await interaction.reply({
+      embeds: [ctx.makeEmbed("Ticket Reassigned", `${interaction.user} reassigned this ticket from <@${previousClaimedBy}>.`, "warn")]
+    });
+    await ctx.sendTypedLog(
+      interaction.guild,
+      "moderation",
+      "Ticket Reassigned",
+      `${interaction.user.tag} reassigned ${interaction.channel.name}.`,
+      "warn",
+      [{ name: "From", value: `<@${previousClaimedBy}>` }]
+    );
+    return true;
+  }
+
+  await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Claimed", `${interaction.user} claimed this ticket.`, "success")] });
+  await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Claimed", `${interaction.user.tag} claimed ${interaction.channel.name}.`, "info");
+  return true;
+}
+
 async function handleMessageCreate(message, ctx) {
   if (!message.guild || message.author.bot) return { stop: false };
   const guildId = message.guild.id;
@@ -844,17 +913,12 @@ async function handleCommand(interaction, ctx) {
     const all = load("ticketMeta", {});
     if (!all[interaction.guild.id]) all[interaction.guild.id] = {};
     if (!all[interaction.guild.id][interaction.channel.id]) {
-      all[interaction.guild.id][interaction.channel.id] = { claimedBy: null, notes: [], closeHistory: [] };
+      all[interaction.guild.id][interaction.channel.id] = { claimedBy: null, claimedAt: null, claimHistory: [], notes: [], closeHistory: [] };
     }
     const meta = all[interaction.guild.id][interaction.channel.id];
 
     if (action === "claim") {
-      meta.claimedBy = interaction.user.id;
-      save("ticketMeta", all);
-      bumpStaffActivity(guildId, interaction.user.id);
-      await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Claimed", `${interaction.user} claimed this ticket.`, "success")] });
-      await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Claimed", `${interaction.user.tag} claimed ${interaction.channel.name}.`, "info");
-      return true;
+      return claimTicket(interaction, ctx, "command");
     }
 
     if (action === "note") {
@@ -1834,18 +1898,7 @@ async function handleButton(interaction, ctx) {
       await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can claim tickets.", "error")], ephemeral: true });
       return true;
     }
-    if (!ctx.isTicketChannel(interaction.channel)) return false;
-
-    const all = load("ticketMeta", {});
-    if (!all[interaction.guild.id]) all[interaction.guild.id] = {};
-    all[interaction.guild.id][interaction.channel.id] = all[interaction.guild.id][interaction.channel.id] || { claimedBy: null, notes: [], closeHistory: [] };
-    all[interaction.guild.id][interaction.channel.id].claimedBy = interaction.user.id;
-    save("ticketMeta", all);
-    bumpStaffActivity(interaction.guild.id, interaction.user.id);
-
-    await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Claimed", `${interaction.user} claimed this ticket.`, "success")] });
-    await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Claimed", `${interaction.user.tag} claimed ${interaction.channel.name}.`, "info");
-    return true;
+    return claimTicket(interaction, ctx, "button");
   }
 
   return false;

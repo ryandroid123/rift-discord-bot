@@ -1160,11 +1160,11 @@ async function applyAutoModAction(message, trigger) {
 }
 
 function canUseModCommand(member) {
-  return hasAnyRole(member, ["Founder", "Admin", "Moderator"]);
+  return hasAnyRole(member, ["Founder", "Admin", "Head Moderator", "Moderator"]);
 }
 
 function canUseBasicModCommand(member) {
-  return hasAnyRole(member, ["Founder", "Admin", "Moderator", "Trial Moderator"]);
+  return hasAnyRole(member, ["Founder", "Admin", "Head Moderator", "Moderator", "Trial Moderator"]);
 }
 
 function canManageTicketsCommand(member) {
@@ -3642,8 +3642,12 @@ if (cmd === "poll") {
       }
 
       if (interaction.customId === "claim_ticket") {
-        if (!hasStaffRole(interaction.member)) {
+        if (!canManageTicketsCommand(interaction.member)) {
           await interaction.reply({ embeds: [makeEmbed("No Permission", "Only Trial Moderator or higher can claim tickets.", "error")], ephemeral: true });
+          return;
+        }
+        if (!isTicketChannel(interaction.channel)) {
+          await interaction.reply({ embeds: [makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
           return;
         }
 

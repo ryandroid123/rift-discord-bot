@@ -3,7 +3,10 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  EmbedBuilder
+  EmbedBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle
 } = require("discord.js");
 const { ensureDataFile, readJson, writeJson, resolveDataPath } = require("./storage");
 
@@ -355,35 +358,143 @@ function checkScamPattern(message, settings) {
   return null;
 }
 
+function parseTicketTopicValue(channel, key) {
+  const topic = String(channel?.topic || "");
+  const safeKey = String(key || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = topic.match(new RegExp(`${safeKey}:([a-zA-Z0-9_-]{1,50})`, "i"));
+  return m ? String(m[1]) : null;
+}
+
+function ensureTicketMeta(all, guildId, channel) {
+  if (!all[guildId]) all[guildId] = {};
+  const ownerId = parseTicketTopicValue(channel, "owner");
+  const ticketType = (parseTicketTopicValue(channel, "type") || "support").toLowerCase();
+  all[guildId][channel.id] = all[guildId][channel.id] || {
+    ownerId: ownerId || null,
+    ticketType,
+    status: "open",
+    priority: "normal",
+    openedAt: channel?.createdTimestamp || Date.now(),
+    panelMessageId: null,
+    claimedBy: null,
+    claimedAt: null,
+    claimHistory: [],
+    reopenHistory: [],
+    notes: [],
+    closeHistory: [],
+    actionHistory: []
+  };
+  const meta = all[guildId][channel.id];
+  if (!meta.ownerId && ownerId) meta.ownerId = ownerId;
+  if (!meta.ticketType && ticketType) meta.ticketType = ticketType;
+  if (!meta.status) meta.status = "open";
+  if (!meta.priority) meta.priority = "normal";
+  if (!Array.isArray(meta.claimHistory)) meta.claimHistory = [];
+  if (!Array.isArray(meta.reopenHistory)) meta.reopenHistory = [];
+  if (!Array.isArray(meta.notes)) meta.notes = [];
+  if (!Array.isArray(meta.closeHistory)) meta.closeHistory = [];
+  if (!Array.isArray(meta.actionHistory)) meta.actionHistory = [];
+  return meta;
+}
+
 function canForceTicketReclaim(member) {
   if (!member?.roles?.cache) return false;
   return member.roles.cache.some(role => ["Founder", "Admin", "Head Moderator"].includes(role.name));
 }
 
-async function claimTicket(interaction, ctx, source = "unknown") {
+function normalizeTicketPriority(raw) {
+  const value = String(raw || "").toLowerCase().trim();
+  if (["low", "normal", "high", "urgent"].includes(value)) return value;
+  return null;
+}
+
+function formatTicketPriority(priority) {
+  const p = normalizeTicketPriority(priority) || "normal";
+  return p[0].toUpperCase() + p.slice(1);
+}
+
+function buildTicketControls(meta) {
+  const isClosed = String(meta.status || "open") === "closed";
+  const priorityLabel = `Priority: ${formatTicketPriority(meta.priority)}`;
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("claim_ticket").setLabel("Claim Ticket").setStyle(ButtonStyle.Primary).setDisabled(isClosed),
+    new ButtonBuilder().setCustomId("unclaim_ticket").setLabel("Unclaim").setStyle(ButtonStyle.Secondary).setDisabled(isClosed),
+    new ButtonBuilder().setCustomId("close_ticket_button").setLabel("Close Ticket").setStyle(ButtonStyle.Danger).setDisabled(isClosed),
+    new ButtonBuilder().setCustomId("reopen_ticket").setLabel("Reopen Ticket").setStyle(ButtonStyle.Success).setDisabled(!isClosed)
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("ticket_priority_cycle").setLabel(priorityLabel).setStyle(ButtonStyle.Secondary).setDisabled(isClosed)
+  );
+  return [row, row2];
+}
+
+function buildTicketStatusEmbed(ctx, interaction, meta) {
+  const status = String(meta.status || "open");
+  const openedAt = Number(meta.openedAt || interaction.channel?.createdTimestamp || Date.now());
+  return ctx.makeEmbed("Ticket Control Panel", [
+    `Status: **${status.toUpperCase()}**`,
+    `Priority: **${formatTicketPriority(meta.priority)}**`,
+    `Owner: ${meta.ownerId ? `<@${meta.ownerId}>` : "Unknown"}`,
+    `Claimed By: ${meta.claimedBy ? `<@${meta.claimedBy}>` : "Unclaimed"}`,
+    `Type: **${meta.ticketType || "support"}**`,
+    `Opened: <t:${Math.floor(openedAt / 1000)}:R>`
+  ].join("\n"), status === "closed" ? "warn" : "info");
+}
+
+async function syncTicketPanel(interaction, ctx, meta, all = null) {
+  const guildId = interaction.guild.id;
+  const payload = {
+    embeds: [buildTicketStatusEmbed(ctx, interaction, meta)],
+    components: buildTicketControls(meta)
+  };
+  if (!meta.panelMessageId) {
+    const recent = await interaction.channel.messages.fetch({ limit: 25 }).catch(() => null);
+    const panel = recent?.find(m => m.author?.id === interaction.client.user.id && m.components?.length);
+    if (panel) meta.panelMessageId = panel.id;
+  }
+  if (!meta.panelMessageId) {
+    const sent = await interaction.channel.send(payload).catch(() => null);
+    if (sent) meta.panelMessageId = sent.id;
+    return;
+  }
+  const panel = await interaction.channel.messages.fetch(meta.panelMessageId).catch(() => null);
+  if (panel) {
+    await panel.edit(payload).catch(() => {});
+    return;
+  }
+  const sent = await interaction.channel.send(payload).catch(() => null);
+  if (sent) meta.panelMessageId = sent.id;
+  if (all) save("ticketMeta", all);
+}
+
+async function claimTicket(interaction, ctx, source = "unknown", targetUserId = null) {
   if (!ctx.isTicketChannel(interaction.channel)) {
     await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
     return true;
   }
-
   const all = load("ticketMeta", {});
-  if (!all[interaction.guild.id]) all[interaction.guild.id] = {};
-  all[interaction.guild.id][interaction.channel.id] = all[interaction.guild.id][interaction.channel.id] || {
-    claimedBy: null,
-    claimedAt: null,
-    claimHistory: [],
-    notes: [],
-    closeHistory: []
-  };
-  const meta = all[interaction.guild.id][interaction.channel.id];
+  const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
   if (!Array.isArray(meta.claimHistory)) meta.claimHistory = [];
-
+  const targetId = targetUserId || interaction.user.id;
+  if (targetId !== interaction.user.id && !canForceTicketReclaim(interaction.member)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only Head Moderator+ can assign a ticket to someone else.", "error")], ephemeral: true });
+    return true;
+  }
+  if (targetId !== interaction.user.id) {
+    const targetMember = await interaction.guild.members.fetch(targetId).catch(() => null);
+    const targetCanManage = targetMember
+      ? (typeof ctx.canManageTicketsCommand === "function" ? ctx.canManageTicketsCommand(targetMember) : ctx.canUseModCommand(targetMember))
+      : false;
+    if (!targetCanManage) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Invalid Staff Target", "You can only assign tickets to ticket staff.", "error")], ephemeral: true });
+      return true;
+    }
+  }
   const previousClaimedBy = meta.claimedBy || null;
-  if (previousClaimedBy === interaction.user.id) {
+  if (previousClaimedBy === targetId) {
     await interaction.reply({ embeds: [ctx.makeEmbed("Already Claimed", "You already claimed this ticket.", "info")], ephemeral: true });
     return true;
   }
-
   if (previousClaimedBy && previousClaimedBy !== interaction.user.id && !canForceTicketReclaim(interaction.member)) {
     await interaction.reply({
       embeds: [ctx.makeEmbed("Already Claimed", `This ticket is already claimed by <@${previousClaimedBy}>. Ask a Head Moderator+ to reassign it.`, "warn")],
@@ -393,20 +504,31 @@ async function claimTicket(interaction, ctx, source = "unknown") {
   }
 
   const now = Date.now();
-  meta.claimedBy = interaction.user.id;
+  meta.claimedBy = targetId;
   meta.claimedAt = now;
   meta.claimHistory.push({
     by: interaction.user.id,
     from: previousClaimedBy,
+    to: targetId,
     at: now,
     source
   });
+  meta.actionHistory.push({
+    action: previousClaimedBy ? "reassign" : "claim",
+    by: interaction.user.id,
+    target: targetId,
+    from: previousClaimedBy,
+    at: now,
+    source
+  });
+  meta.status = "open";
   save("ticketMeta", all);
+  await syncTicketPanel(interaction, ctx, meta, all);
   bumpStaffActivity(interaction.guild.id, interaction.user.id);
 
   if (previousClaimedBy && previousClaimedBy !== interaction.user.id) {
     await interaction.reply({
-      embeds: [ctx.makeEmbed("Ticket Reassigned", `${interaction.user} reassigned this ticket from <@${previousClaimedBy}>.`, "warn")]
+      embeds: [ctx.makeEmbed("Ticket Reassigned", `${interaction.user} reassigned this ticket from <@${previousClaimedBy}> to <@${targetId}>.`, "warn")]
     });
     await ctx.sendTypedLog(
       interaction.guild,
@@ -414,13 +536,263 @@ async function claimTicket(interaction, ctx, source = "unknown") {
       "Ticket Reassigned",
       `${interaction.user.tag} reassigned ${interaction.channel.name}.`,
       "warn",
-      [{ name: "From", value: `<@${previousClaimedBy}>` }]
+      [
+        { name: "From", value: `<@${previousClaimedBy}>`, inline: true },
+        { name: "To", value: `<@${targetId}>`, inline: true }
+      ]
     );
     return true;
   }
 
-  await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Claimed", `${interaction.user} claimed this ticket.`, "success")] });
-  await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Claimed", `${interaction.user.tag} claimed ${interaction.channel.name}.`, "info");
+  const claimText = targetId === interaction.user.id
+    ? `${interaction.user} claimed this ticket.`
+    : `${interaction.user} assigned this ticket to <@${targetId}>.`;
+  await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Claimed", claimText, "success")] });
+  await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Claimed", `${interaction.user.tag} claimed ${interaction.channel.name}.`, "info", [
+    { name: "Assigned To", value: `<@${targetId}>`, inline: true }
+  ]);
+  return true;
+}
+
+async function unclaimTicket(interaction, ctx, source = "unknown") {
+  if (!ctx.isTicketChannel(interaction.channel)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+    return true;
+  }
+  const all = load("ticketMeta", {});
+  const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+  const previousClaimedBy = meta.claimedBy || null;
+  if (!previousClaimedBy) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Already Unclaimed", "This ticket is currently unclaimed.", "info")], ephemeral: true });
+    return true;
+  }
+  if (previousClaimedBy !== interaction.user.id && !canForceTicketReclaim(interaction.member)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only the claimer or Head Moderator+ can unclaim this ticket.", "error")], ephemeral: true });
+    return true;
+  }
+  const now = Date.now();
+  meta.claimedBy = null;
+  meta.claimedAt = null;
+  meta.claimHistory.push({ by: interaction.user.id, from: previousClaimedBy, to: null, at: now, source });
+  meta.actionHistory.push({ action: "unclaim", by: interaction.user.id, from: previousClaimedBy, at: now, source });
+  save("ticketMeta", all);
+  await syncTicketPanel(interaction, ctx, meta, all);
+  bumpStaffActivity(interaction.guild.id, interaction.user.id);
+  await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Unclaimed", `${interaction.user} unclaimed this ticket.`, "info")] });
+  await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Unclaimed", `${interaction.user.tag} unclaimed ${interaction.channel.name}.`, "info", [
+    { name: "Previous Claimer", value: `<@${previousClaimedBy}>`, inline: true }
+  ]);
+  return true;
+}
+
+async function setTicketPriority(interaction, ctx, nextPriority, source = "unknown") {
+  if (!ctx.isTicketChannel(interaction.channel)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+    return true;
+  }
+  const all = load("ticketMeta", {});
+  const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+  const normalized = normalizeTicketPriority(nextPriority);
+  if (!normalized) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Invalid Priority", "Use `low`, `normal`, `high`, or `urgent`.", "error")], ephemeral: true });
+    return true;
+  }
+  if (normalized === meta.priority) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Priority Unchanged", `Priority is already **${formatTicketPriority(normalized)}**.`, "info")], ephemeral: true });
+    return true;
+  }
+  const previous = meta.priority;
+  meta.priority = normalized;
+  meta.actionHistory.push({ action: "priority", by: interaction.user.id, from: previous, to: normalized, at: Date.now(), source });
+  save("ticketMeta", all);
+  await syncTicketPanel(interaction, ctx, meta, all);
+  await interaction.reply({ embeds: [ctx.makeEmbed("Priority Updated", `Priority changed from **${formatTicketPriority(previous)}** to **${formatTicketPriority(normalized)}**.`, "success")], ephemeral: true });
+  await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Priority Updated", `${interaction.user.tag} changed ${interaction.channel.name} priority.`, "info", [
+    { name: "From", value: formatTicketPriority(previous), inline: true },
+    { name: "To", value: formatTicketPriority(normalized), inline: true }
+  ]);
+  return true;
+}
+
+async function closeTicket(interaction, ctx, options = {}) {
+  if (!ctx.isTicketChannel(interaction.channel)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+    return true;
+  }
+  const reason = String(options.reason || "No reason provided").slice(0, 700);
+  const source = options.source || "unknown";
+  const hardDelete = options.hardDelete === true;
+  const all = load("ticketMeta", {});
+  const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+  if (meta.status === "closed" && !hardDelete) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Already Closed", "This ticket is already closed. Use reopen if needed.", "info")], ephemeral: true });
+    return true;
+  }
+
+  const messages = await interaction.channel.messages.fetch({ limit: 250 }).catch(() => null);
+  const orderedMessages = [...(messages?.values() || [])].reverse();
+  const closedAt = Date.now();
+  meta.status = "closed";
+  meta.closedAt = closedAt;
+  meta.closedBy = interaction.user.id;
+  meta.closeReason = reason;
+  meta.closeHistory.push({ by: interaction.user.id, reason, at: closedAt, source, hardDelete });
+  meta.actionHistory.push({ action: "close", by: interaction.user.id, reason, at: closedAt, source, hardDelete });
+  save("ticketMeta", all);
+
+  const transcriptInfo = await ctx.sendTranscript(interaction.guild, interaction.channel, orderedMessages, {
+    ticketOwnerId: meta.ownerId || null,
+    ticketType: meta.ticketType || "support",
+    ticketStatus: meta.status,
+    priority: meta.priority || "normal",
+    claimedBy: meta.claimedBy || null,
+    closedBy: interaction.user.id,
+    closeReason: reason,
+    messageCount: orderedMessages.length
+  });
+
+  const index = load("transcriptIndex", []);
+  index.push({
+    guildId: interaction.guild.id,
+    channelId: interaction.channel.id,
+    channelName: interaction.channel.name,
+    ticketOwnerId: meta.ownerId || null,
+    ticketType: meta.ticketType || "support",
+    status: meta.status,
+    priority: meta.priority || "normal",
+    claimedBy: meta.claimedBy || null,
+    time: closedAt,
+    closedBy: interaction.user.id,
+    reason,
+    source,
+    transcriptFile: transcriptInfo?.fileName || null,
+    preview: orderedMessages.map(m => m.content || "").join(" ").slice(0, 350)
+  });
+  save("transcriptIndex", index.slice(-5000));
+
+  if (meta.ownerId) {
+    await interaction.channel.permissionOverwrites.edit(meta.ownerId, {
+      SendMessages: false,
+      AddReactions: false
+    }).catch(() => {});
+  }
+
+  if (!hardDelete) {
+    if (!String(interaction.channel.name || "").startsWith("closed-")) {
+      const trimmed = String(interaction.channel.name || "ticket").slice(0, 92);
+      await interaction.channel.setName(`closed-${trimmed}`).catch(() => {});
+    }
+    await syncTicketPanel(interaction, ctx, meta, all);
+    await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Closed", `Reason: ${reason}\nThis ticket is now archived. Use \`/ticket reopen\` to reopen.`, "warn")] });
+  } else {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Closing Ticket", `Reason: ${reason}\nDeleting in 5 seconds.`, "warn")] });
+  }
+
+  await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn", [
+    { name: "Reason", value: reason },
+    { name: "Mode", value: hardDelete ? "hard-delete" : "archive", inline: true },
+    { name: "Priority", value: formatTicketPriority(meta.priority), inline: true }
+  ]);
+
+  if (hardDelete) {
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
+  }
+  return true;
+}
+
+async function reopenTicket(interaction, ctx, source = "unknown") {
+  if (!ctx.isTicketChannel(interaction.channel)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+    return true;
+  }
+  const all = load("ticketMeta", {});
+  const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+  if (meta.status !== "closed") {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Not Closed", "This ticket is already open.", "info")], ephemeral: true });
+    return true;
+  }
+  meta.status = "open";
+  meta.reopenHistory.push({ by: interaction.user.id, at: Date.now(), source });
+  meta.actionHistory.push({ action: "reopen", by: interaction.user.id, at: Date.now(), source });
+  save("ticketMeta", all);
+
+  if (meta.ownerId) {
+    await interaction.channel.permissionOverwrites.edit(meta.ownerId, {
+      SendMessages: true,
+      AddReactions: true,
+      AttachFiles: true
+    }).catch(() => {});
+  }
+  if (String(interaction.channel.name || "").startsWith("closed-")) {
+    await interaction.channel.setName(String(interaction.channel.name).replace(/^closed-/, "")).catch(() => {});
+  }
+  await syncTicketPanel(interaction, ctx, meta, all);
+  await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Reopened", `${interaction.user} reopened this ticket.`, "success")] });
+  await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Reopened", `${interaction.user.tag} reopened ${interaction.channel.name}.`, "success");
+  return true;
+}
+
+async function showTicketStatus(interaction, ctx) {
+  if (!ctx.isTicketChannel(interaction.channel)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+    return true;
+  }
+  const all = load("ticketMeta", {});
+  const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+  const closedAt = meta.closedAt ? `<t:${Math.floor(Number(meta.closedAt) / 1000)}:R>` : "n/a";
+  const text = [
+    `Status: **${String(meta.status || "open").toUpperCase()}**`,
+    `Priority: **${formatTicketPriority(meta.priority)}**`,
+    `Owner: ${meta.ownerId ? `<@${meta.ownerId}>` : "Unknown"}`,
+    `Claimed By: ${meta.claimedBy ? `<@${meta.claimedBy}>` : "Unclaimed"}`,
+    `Opened: <t:${Math.floor(Number(meta.openedAt || interaction.channel.createdTimestamp || Date.now()) / 1000)}:R>`,
+    `Last Closed: ${closedAt}`,
+    `Notes: **${meta.notes.length}**`,
+    `Claim Actions: **${meta.claimHistory.length}**`
+  ].join("\n");
+  await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Status", text, "info")] });
+  return true;
+}
+
+async function showTicketHistory(interaction, ctx) {
+  if (!ctx.isTicketChannel(interaction.channel)) {
+    await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+    return true;
+  }
+  const all = load("ticketMeta", {});
+  const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+  const rows = (meta.actionHistory || [])
+    .slice(-20)
+    .reverse()
+    .map(item => {
+      const when = `<t:${Math.floor(Number(item.at || Date.now()) / 1000)}:R>`;
+      const by = item.by ? `<@${item.by}>` : "Unknown";
+      const detail = item.reason ? ` - ${String(item.reason).slice(0, 80)}` : "";
+      return `${when} - **${String(item.action || "action")}** by ${by}${detail}`;
+    });
+  await interaction.reply({ embeds: [ctx.makeEmbed("Ticket History", rows.length ? rows.join("\n") : "No ticket history yet.", "info")], ephemeral: true });
+  return true;
+}
+
+async function listTickets(interaction, ctx, keyword = "") {
+  const all = load("ticketMeta", {});
+  const guildMeta = all[interaction.guild.id] || {};
+  const search = String(keyword || "").toLowerCase().trim();
+  const rows = Object.entries(guildMeta)
+    .map(([channelId, meta]) => ({ channelId, meta: meta || {}, channel: interaction.guild.channels.cache.get(channelId) }))
+    .filter(item => item.channel)
+    .filter(item => {
+      if (!search) return true;
+      const ownerHit = String(item.meta.ownerId || "").includes(search);
+      const channelHit = String(item.channel.name || "").toLowerCase().includes(search);
+      return ownerHit || channelHit;
+    })
+    .sort((a, b) => Number(b.meta.openedAt || 0) - Number(a.meta.openedAt || 0))
+    .slice(0, 20);
+  const text = rows.length
+    ? rows.map(item => `${item.channel} - ${String(item.meta.status || "open").toUpperCase()} - ${formatTicketPriority(item.meta.priority)} - ${item.meta.claimedBy ? `claimed by <@${item.meta.claimedBy}>` : "unclaimed"}`).join("\n")
+    : "No ticket channels found.";
+  await interaction.reply({ embeds: [ctx.makeEmbed("Ticket List", text, "info")], ephemeral: true });
   return true;
 }
 
@@ -753,6 +1125,17 @@ async function handleCommand(interaction, ctx) {
     return true;
   }
 
+  if (cmd === "close") {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can close tickets.", "error")], ephemeral: true });
+      return true;
+    }
+    const reason = interaction.options.getString("reason") || "Closed via /close";
+    return closeTicket(interaction, ctx, { reason, source: "slash-close", hardDelete: true });
+  }
   if (cmd === "giveaway") {
     const duration = interaction.options.getString("duration");
     const prize = interaction.options.getString("prize");
@@ -903,75 +1286,60 @@ async function handleCommand(interaction, ctx) {
       await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can manage tickets.", "error")], ephemeral: true });
       return true;
     }
-    const action = interaction.options.getString("action");
+
+    const action = String(interaction.options.getString("action") || "").toLowerCase();
     const reason = interaction.options.getString("reason") || "No reason provided";
-    if (!ctx.isTicketChannel(interaction.channel)) {
-      await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This command only works in tickets.", "error")], ephemeral: true });
-      return true;
-    }
+    const targetUser = interaction.options.getUser("user");
 
-    const all = load("ticketMeta", {});
-    if (!all[interaction.guild.id]) all[interaction.guild.id] = {};
-    if (!all[interaction.guild.id][interaction.channel.id]) {
-      all[interaction.guild.id][interaction.channel.id] = { claimedBy: null, claimedAt: null, claimHistory: [], notes: [], closeHistory: [] };
-    }
-    const meta = all[interaction.guild.id][interaction.channel.id];
-
-    if (action === "claim") {
-      return claimTicket(interaction, ctx, "command");
-    }
-
-    if (action === "note") {
-      meta.notes.push({ by: interaction.user.id, text: reason, at: Date.now() });
-      save("ticketMeta", all);
-      await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Note Added", reason, "info")], ephemeral: true });
-      return true;
+    if (action === "list") {
+      return listTickets(interaction, ctx, reason);
     }
 
     if (action === "transcriptsearch") {
       const index = load("transcriptIndex", []);
       const rows = index
         .filter(x => x.guildId === guildId && (!reason || String(x.preview || "").toLowerCase().includes(reason.toLowerCase())))
-        .slice(-15)
+        .slice(-20)
         .reverse();
-      const text = rows.length ? rows.map(x => `• ${x.channelName} • <t:${Math.floor(x.time / 1000)}:R>\n${x.preview}`).join("\n\n") : "No transcript matches.";
+      const text = rows.length ? rows.map(x => `- ${x.channelName} - <t:${Math.floor(Number(x.time || Date.now()) / 1000)}:R>\n${x.preview || ""}`).join("\n\n") : "No transcript matches.";
       await interaction.reply({ embeds: [ctx.makeEmbed("Transcript Search", text.slice(0, 3900), "info")], ephemeral: true });
       return true;
     }
 
-    if (action === "close") {
-      meta.closeHistory.push({ by: interaction.user.id, reason, at: Date.now() });
-      save("ticketMeta", all);
-
-      const messages = await interaction.channel.messages.fetch({ limit: 200 }).catch(() => null);
-      const orderedMessages = [...(messages?.values() || [])].reverse();
-      await ctx.sendTranscript(interaction.guild, interaction.channel, orderedMessages, {
-        ticketOwnerId: null,
-        closedBy: interaction.user.id,
-        closeReason: reason,
-        messageCount: orderedMessages.length
-      });
-
-      const index = load("transcriptIndex", []);
-      index.push({
-        guildId,
-        channelId: interaction.channel.id,
-        channelName: interaction.channel.name,
-        time: Date.now(),
-        closedBy: interaction.user.id,
-        reason,
-        preview: orderedMessages.map(m => m.content || "").join(" ").slice(0, 250)
-      });
-      save("transcriptIndex", index.slice(-5000));
-
-      bumpStaffActivity(guildId, interaction.user.id);
-      await interaction.reply({ embeds: [ctx.makeEmbed("Closing Ticket", `Reason: ${reason}\nDeleting in 5 seconds.`, "warn")] });
-      await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn", [
-        { name: "Reason", value: reason }
-      ]);
-      setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
+    if (!ctx.isTicketChannel(interaction.channel)) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This command only works in tickets.", "error")], ephemeral: true });
       return true;
     }
+
+    const all = load("ticketMeta", {});
+    const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+    save("ticketMeta", all);
+
+    if (action === "claim") return claimTicket(interaction, ctx, "command", targetUser?.id || interaction.user.id);
+    if (action === "unclaim") return unclaimTicket(interaction, ctx, "command");
+    if (action === "close") return closeTicket(interaction, ctx, { reason, source: "ticket-command", hardDelete: false });
+    if (action === "reopen") return reopenTicket(interaction, ctx, "ticket-command");
+    if (action === "status") return showTicketStatus(interaction, ctx);
+    if (action === "history") return showTicketHistory(interaction, ctx);
+    if (action === "priority") return setTicketPriority(interaction, ctx, reason, "command");
+
+    if (action === "note") {
+      const noteText = String(reason || "").trim();
+      if (!noteText || noteText.toLowerCase() === "no reason provided") {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Missing Note", "Provide note text in `reason`.", "error")], ephemeral: true });
+        return true;
+      }
+      meta.notes.push({ by: interaction.user.id, text: noteText, at: Date.now() });
+      meta.actionHistory.push({ action: "note", by: interaction.user.id, reason: noteText.slice(0, 140), at: Date.now(), source: "command" });
+      save("ticketMeta", all);
+      bumpStaffActivity(guildId, interaction.user.id);
+      await interaction.reply({ embeds: [ctx.makeEmbed("Ticket Note Added", noteText, "info")], ephemeral: true });
+      await ctx.sendTypedLog(interaction.guild, "moderation", "Ticket Note Added", `${interaction.user.tag} added a note in ${interaction.channel.name}.`, "info");
+      return true;
+    }
+
+    await interaction.reply({ embeds: [ctx.makeEmbed("Unknown Ticket Action", "Use a valid ticket action.", "error")], ephemeral: true });
+    return true;
   }
 
   if (cmd === "welcome") {
@@ -1901,10 +2269,89 @@ async function handleButton(interaction, ctx) {
     return claimTicket(interaction, ctx, "button");
   }
 
+  if (interaction.customId === "unclaim_ticket") {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can unclaim tickets.", "error")], ephemeral: true });
+      return true;
+    }
+    return unclaimTicket(interaction, ctx, "button");
+  }
+
+  if (interaction.customId === "reopen_ticket") {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can reopen tickets.", "error")], ephemeral: true });
+      return true;
+    }
+    return reopenTicket(interaction, ctx, "button");
+  }
+
+  if (interaction.customId === "ticket_priority_cycle") {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can change ticket priority.", "error")], ephemeral: true });
+      return true;
+    }
+    const all = load("ticketMeta", {});
+    const meta = ensureTicketMeta(all, interaction.guild.id, interaction.channel);
+    const current = normalizeTicketPriority(meta.priority) || "normal";
+    const order = ["low", "normal", "high", "urgent"];
+    const next = order[(order.indexOf(current) + 1) % order.length];
+    return setTicketPriority(interaction, ctx, next, "priority-button");
+  }
+
+  if (interaction.customId === "close_ticket_button") {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can close tickets.", "error")], ephemeral: true });
+      return true;
+    }
+    if (!ctx.isTicketChannel(interaction.channel)) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Not a Ticket", "This only works in a ticket channel.", "error")], ephemeral: true });
+      return true;
+    }
+    const modal = new ModalBuilder()
+      .setCustomId("ticket_close_reason_modal")
+      .setTitle("Close Ticket");
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("close_reason")
+          .setLabel("Close reason")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(false)
+          .setPlaceholder("Resolved issue / duplicate / no response / etc.")
+      )
+    );
+    await interaction.showModal(modal);
+    return true;
+  }
+
   return false;
 }
 
-async function handleModal() {
+async function handleModal(interaction, ctx) {
+  if (!interaction.isModalSubmit()) return false;
+  if (interaction.customId === "ticket_close_reason_modal") {
+    const canManageTickets = typeof ctx.canManageTicketsCommand === "function"
+      ? ctx.canManageTicketsCommand(interaction.member)
+      : ctx.canUseModCommand(interaction.member);
+    if (!canManageTickets) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can close tickets.", "error")], ephemeral: true });
+      return true;
+    }
+    const reason = String(interaction.fields.getTextInputValue("close_reason") || "").trim() || "Closed via ticket button";
+    return closeTicket(interaction, ctx, { reason, source: "close-button-modal", hardDelete: false });
+  }
   return false;
 }
 

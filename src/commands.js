@@ -4,7 +4,13 @@ module.exports = [
 
   { name: "setup-support-panel", description: "Post the support ticket panel." },
   { name: "setup-application-panel", description: "Post the application ticket panel." },
-  { name: "close", description: "Close the current ticket." },
+  {
+    name: "close",
+    description: "Close the current ticket.",
+    options: [
+      { name: "reason", type: 3, required: false, description: "Close reason" }
+    ]
+  },
 
   {
     name: "timeout",
@@ -347,15 +353,22 @@ module.exports = [
         name: "action",
         type: 3,
         required: true,
-        description: "claim/close/note/transcriptsearch",
+        description: "claim/unclaim/close/reopen/note/status/history/priority/list/transcriptsearch",
         choices: [
           { name: "claim", value: "claim" },
+          { name: "unclaim", value: "unclaim" },
           { name: "close", value: "close" },
+          { name: "reopen", value: "reopen" },
           { name: "note", value: "note" },
+          { name: "status", value: "status" },
+          { name: "history", value: "history" },
+          { name: "priority", value: "priority" },
+          { name: "list", value: "list" },
           { name: "transcriptsearch", value: "transcriptsearch" }
         ]
       },
-      { name: "reason", type: 3, required: false, description: "Close reason, note, or search text" }
+      { name: "reason", type: 3, required: false, description: "Reason, note, search text, or priority (low/normal/high/urgent)" },
+      { name: "user", type: 6, required: false, description: "Target staff user for claim/reassign" }
     ]
   },
   {

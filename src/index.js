@@ -72,6 +72,7 @@ const automodPath = resolveDataPath("automod.json");
 const moderationLogPath = resolveDataPath("moderation-log.json");
 const backupsPath = resolveDataPath("backups.json");
 const transcriptDir = resolveDataPath("transcripts");
+const ticketMetaPath = resolveDataPath("ticket-meta.json");
 
 ensureDataFile("giveaways.json", []);
 ensureDataFile("streams.json", []);
@@ -83,6 +84,7 @@ ensureDataFile("snipe.json", {});
 ensureDataFile("automod.json", {});
 ensureDataFile("moderation-log.json", []);
 ensureDataFile("backups.json", []);
+ensureDataFile("ticket-meta.json", {});
 if (!fs.existsSync(transcriptDir)) fs.mkdirSync(transcriptDir, { recursive: true });
 
 const automodCache = new Map();
@@ -1234,6 +1236,12 @@ function parseTicketOwnerId(channel) {
   return m ? m[1] : null;
 }
 
+function parseTicketType(channel) {
+  const topic = String(channel?.topic || "");
+  const m = topic.match(/type:([a-z-]+)/i);
+  return m ? String(m[1]).toLowerCase() : "unknown";
+}
+
 function formatTranscriptMessage(message) {
   const ts = new Date(message.createdTimestamp || Date.now()).toISOString();
   const author = message.author ? `${message.author.tag} (${message.author.id})` : "Unknown";
@@ -1279,6 +1287,10 @@ function buildTranscriptText(ticketChannel, messages, meta = {}) {
   lines.push(`Channel Created: ${ticketChannel?.createdTimestamp ? new Date(ticketChannel.createdTimestamp).toISOString() : "Unknown"}`);
   lines.push(`Channel ID: ${ticketChannel?.id || "unknown"}`);
   lines.push(`Ticket Owner: ${ownerId ? `<@${ownerId}> (${ownerId})` : "Unknown"}`);
+  lines.push(`Ticket Type: ${meta.ticketType || parseTicketType(ticketChannel) || "unknown"}`);
+  lines.push(`Ticket Status: ${meta.ticketStatus || "closed"}`);
+  lines.push(`Ticket Priority: ${meta.priority || "normal"}`);
+  lines.push(`Claimed By: ${meta.claimedBy ? `<@${meta.claimedBy}> (${meta.claimedBy})` : "Unclaimed"}`);
   lines.push(`Closed By: ${meta.closedBy ? `<@${meta.closedBy}> (${meta.closedBy})` : "Unknown"}`);
   lines.push(`Close Reason: ${meta.closeReason || "No reason provided"}`);
   lines.push(`Message Count: ${messageCount}`);
@@ -1301,7 +1313,7 @@ function buildTranscriptText(ticketChannel, messages, meta = {}) {
 
 async function sendTranscript(guild, ticketChannel, linesOrMessages, meta = {}) {
   const ch = transcriptChannel(guild);
-  if (!ch) return;
+  if (!ch) return null;
 
   const items = Array.isArray(linesOrMessages) ? linesOrMessages : [];
   const isMessageObject = items.length ? typeof items[0] === "object" && items[0] !== null && "createdTimestamp" in items[0] : false;
@@ -1310,7 +1322,8 @@ async function sendTranscript(guild, ticketChannel, linesOrMessages, meta = {}) 
     : String((items || []).join("\n")).trim() + "\n";
 
   const safeName = String(ticketChannel.name || "ticket").replace(/[^a-zA-Z0-9-_]/g, "_");
-  const filePath = resolveDataPath("transcripts", `${safeName}-${Date.now()}.txt`);
+  const fileName = `${safeName}-${Date.now()}.txt`;
+  const filePath = resolveDataPath("transcripts", fileName);
   fs.writeFileSync(filePath, transcriptText, "utf8");
   const sizeBytes = Buffer.byteLength(transcriptText, "utf8");
   const sizeKb = (sizeBytes / 1024).toFixed(2);
@@ -1323,6 +1336,12 @@ async function sendTranscript(guild, ticketChannel, linesOrMessages, meta = {}) 
   }).catch(() => {});
 
   fs.unlink(filePath, () => {});
+  return {
+    fileName,
+    sizeBytes,
+    sizeKb: Number(sizeKb),
+    messageCount: meta.messageCount || items.length || 0
+  };
 }
 
 function isTicketChannel(channel) {
@@ -1376,12 +1395,20 @@ async function createTicket(guild, user, type, answers = null) {
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("claim_ticket").setLabel("Claim Ticket").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("close_ticket_button").setLabel("Close Ticket").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId("unclaim_ticket").setLabel("Unclaim").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("close_ticket_button").setLabel("Close Ticket").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("reopen_ticket").setLabel("Reopen Ticket").setStyle(ButtonStyle.Success).setDisabled(true)
+  );
+  const priorityRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("ticket_priority_cycle").setLabel("Priority: Normal").setStyle(ButtonStyle.Secondary)
   );
 
   const fields = [
     { name: "Opened By", value: user.tag, inline: true },
-    { name: "Type", value: type === "support" ? "Support" : "Staff Application", inline: true }
+    { name: "Type", value: type === "support" ? "Support" : "Staff Application", inline: true },
+    { name: "Status", value: "Open", inline: true },
+    { name: "Priority", value: "Normal", inline: true },
+    { name: "Claimed By", value: "Unclaimed", inline: true }
   ];
 
   if (answers) {
@@ -1393,12 +1420,16 @@ async function createTicket(guild, user, type, answers = null) {
     );
   }
 
-  await channel.send({
+  const staffPing = type === "support"
+    ? getStaffRoles(guild)
+      .filter(r => ["Head Moderator", "Moderator", "Trial Moderator"].includes(r.name))
+      .map(r => `<@&${r.id}>`)
+      .join(" ")
+    : "";
+
+  const panel = await channel.send({
     content: type === "support"
-      ? (() => {
-          const moderatorRole = getRoleByName(guild, "Moderator");
-          return moderatorRole ? `<@&${moderatorRole.id}>` : "";
-        })()
+      ? staffPing
       : "",
     embeds: [
       makeEmbed(
@@ -1412,8 +1443,27 @@ async function createTicket(guild, user, type, answers = null) {
         fields
       )
     ],
-    components: [row]
+    components: [row, priorityRow]
   });
+
+  const allTicketMeta = readJson(ticketMetaPath, {});
+  if (!allTicketMeta[guild.id]) allTicketMeta[guild.id] = {};
+  allTicketMeta[guild.id][channel.id] = {
+    claimedBy: null,
+    claimedAt: null,
+    claimHistory: [],
+    notes: [],
+    closeHistory: [],
+    reopenHistory: [],
+    status: "open",
+    priority: "normal",
+    ownerId: user.id,
+    ticketType: type,
+    openedAt: Date.now(),
+    panelMessageId: panel.id,
+    actionHistory: [{ action: "opened", by: user.id, at: Date.now(), source: "create-ticket" }]
+  };
+  writeJson(ticketMetaPath, allTicketMeta);
 
   await sendLog(guild, "Ticket Opened", `${user.tag} opened a ${type} ticket.`, "success", [
     { name: "Channel", value: `${channel}` }
@@ -2637,17 +2687,20 @@ client.on(Events.InteractionCreate, async interaction => {
           return;
         }
 
+        const reason = interaction.options.getString("reason") || "Closed via /close";
         const messages = await interaction.channel.messages.fetch({ limit: 200 }).catch(() => null);
         const orderedMessages = [...(messages?.values() || [])].reverse();
         await sendTranscript(interaction.guild, interaction.channel, orderedMessages, {
           ticketOwnerId: parseTicketOwnerId(interaction.channel),
           closedBy: interaction.user.id,
-          closeReason: "Closed via /close",
+          closeReason: reason,
           messageCount: orderedMessages.length
         });
 
-        await interaction.reply({ embeds: [makeEmbed("Closing Ticket", "This ticket will be deleted in 5 seconds.", "warn")] });
-        await sendTypedLog(interaction.guild, "moderation", "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn");
+        await interaction.reply({ embeds: [makeEmbed("Closing Ticket", `Reason: ${reason}\nThis ticket will be deleted in 5 seconds.`, "warn")] });
+        await sendTypedLog(interaction.guild, "moderation", "Ticket Closed", `${interaction.user.tag} closed ${interaction.channel.name}.`, "warn", [
+          { name: "Reason", value: reason }
+        ]);
 
         setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
         return;

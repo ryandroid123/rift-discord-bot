@@ -2364,11 +2364,21 @@ async function handleRiddleGuess(message) {
     await winnerMember.roles.add(geniusRole, "Won riddle first").catch(() => {});
   }
 
+  const winnerName = winnerMember?.displayName || message.author.username || "Champion";
+  const shoutName = String(winnerName).toUpperCase();
+  const hypeLines = [
+    `WOAH ${shoutName} WON!`,
+    `${shoutName} JUST SNIPED THE ANSWER!`,
+    `BIG BRAIN ALERT: ${shoutName}!`,
+    `${shoutName} CRACKED IT FIRST!`
+  ];
+  const hype = hypeLines[Math.floor(Math.random() * hypeLines.length)];
+
   await message.channel.send({
     embeds: [
       makeEmbed(
-        "Riddle Solved",
-        `${message.author} got it first and now has the **Genius** role.\nCurrent streak: **${nextStreak}**`,
+        "Riddle Solved!",
+        `${hype}\n${message.author} now holds the **Genius** role.\nCurrent streak: **${nextStreak}**`,
         "success"
       )
     ]

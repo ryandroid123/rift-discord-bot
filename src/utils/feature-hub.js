@@ -1,4 +1,7 @@
 const ms = require("ms");
+const { DisTube } = require("distube");
+const { YtDlpPlugin } = require("@distube/yt-dlp");
+const { SpotifyPlugin } = require("@distube/spotify");
 const {
   ActionRowBuilder,
   ButtonBuilder,
@@ -9,6 +12,7 @@ const {
   TextInputStyle
 } = require("discord.js");
 const { ensureDataFile, readJson, writeJson, resolveDataPath } = require("./storage");
+const fetchFn = typeof fetch === "function" ? fetch.bind(globalThis) : require("node-fetch");
 
 const DATA_FILES = {
   guildSettings: "feature-settings.json",
@@ -31,7 +35,12 @@ const DATA_FILES = {
   ghostPings: "ghostpings.json",
   watchlist: "watchlist.json",
   bumpTracking: "bump-tracking.json",
-  transcriptIndex: "transcript-index.json"
+  transcriptIndex: "transcript-index.json",
+  shopItems: "shop-items.json",
+  inventories: "inventories.json",
+  reactionRoles: "reaction-roles.json",
+  musicQueues: "music-queues.json",
+  prestige: "prestige.json"
 };
 
 const FILE_DEFAULTS = {
@@ -55,7 +64,12 @@ const FILE_DEFAULTS = {
   "ghostpings.json": [],
   "watchlist.json": [],
   "bump-tracking.json": {},
-  "transcript-index.json": []
+  "transcript-index.json": [],
+  "shop-items.json": {},
+  "inventories.json": {},
+  "reaction-roles.json": {},
+  "music-queues.json": {},
+  "prestige.json": {}
 };
 
 for (const file of Object.values(DATA_FILES)) {
@@ -67,6 +81,10 @@ const selfbotWindow = new Map();
 const stickyCooldown = new Map();
 const ticketOpenBurstGuard = new Map();
 const ticketDeleteInFlight = new Map();
+const utilityCooldown = new Map();
+const weatherCache = new Map();
+const rateCache = new Map();
+let distube = null;
 let profilesCache = null;
 let profilesDirty = false;
 let profilesFlushTimer = null;
@@ -79,6 +97,42 @@ function load(name, fallback) {
 function save(name, value) {
   const file = DATA_FILES[name];
   writeJson(resolveDataPath(file), value);
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  if (typeof timer.unref === "function") timer.unref();
+  try {
+    return await fetchFn(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isUtilityRateLimited(guildId, userId, action, minSeconds = 7) {
+  const key = `${guildId}:${userId}:${action}`;
+  const now = Date.now();
+  const last = utilityCooldown.get(key) || 0;
+  if (now - last < minSeconds * 1000) {
+    return Math.ceil((minSeconds * 1000 - (now - last)) / 1000);
+  }
+  utilityCooldown.set(key, now);
+  return 0;
+}
+
+function saveMusicQueueSnapshot(guildId, snapshot) {
+  if (!guildId) return;
+  const all = load("musicQueues", {});
+  all[guildId] = snapshot;
+  save("musicQueues", all);
+}
+
+function getGuildPrestige(guildId, userId) {
+  const all = load("prestige", {});
+  if (!all[guildId]) all[guildId] = {};
+  if (!all[guildId][userId]) all[guildId][userId] = { tier: 0, totalPrestiges: 0, lastAt: null };
+  return { all, item: all[guildId][userId] };
 }
 
 function shouldBlockTicketOpenBurst(guildId, userId, type, windowMs = 5000) {
@@ -232,6 +286,33 @@ function updateProfile(guildId, userId, updater) {
   updater(p);
   scheduleProfilesFlush();
   return p;
+}
+
+function ensureGuildMap(data, guildId) {
+  if (!data[guildId]) data[guildId] = {};
+  return data[guildId];
+}
+
+function ensureInventory(data, guildId, userId) {
+  const guildInv = ensureGuildMap(data, guildId);
+  if (!Array.isArray(guildInv[userId])) guildInv[userId] = [];
+  return guildInv[userId];
+}
+
+function getAchievementRows(p) {
+  const xp = Number(p?.xp || 0);
+  const lvl = Number(p?.level || 0);
+  const coins = Number(p?.currency || 0);
+  const joins = Number(p?.joins || 0);
+  return [
+    { key: "first_steps", name: "First Steps", unlocked: xp >= 25 },
+    { key: "chatterbox", name: "Chatterbox", unlocked: xp >= 500 },
+    { key: "grinder", name: "Grinder", unlocked: xp >= 2500 },
+    { key: "rookie_leveler", name: "Rookie Leveler", unlocked: lvl >= 5 },
+    { key: "elite_leveler", name: "Elite Leveler", unlocked: lvl >= 15 },
+    { key: "wealthy", name: "Wealthy", unlocked: coins >= 1000 },
+    { key: "veteran", name: "Veteran", unlocked: joins >= 10 }
+  ];
 }
 
 function bumpStaffActivity(guildId, userId) {
@@ -391,6 +472,50 @@ async function maybeRunSchedules(client, ctx) {
 
 async function onReady(client, ctx) {
   getProfilesData();
+  if (!distube) {
+    distube = new DisTube(client, {
+      emitNewSongOnly: true,
+      emitAddSongWhenCreatingQueue: false,
+      plugins: [new YtDlpPlugin(), new SpotifyPlugin()]
+    });
+
+    distube
+      .on("playSong", (queue, song) => {
+        saveMusicQueueSnapshot(queue.textChannel?.guild?.id, {
+          voiceChannelId: queue.voiceChannel?.id || null,
+          textChannelId: queue.textChannel?.id || null,
+          nowPlaying: { name: song.name, url: song.url, duration: song.formattedDuration || null },
+          queued: queue.songs.slice(1, 25).map(s => ({ name: s.name, url: s.url, duration: s.formattedDuration || null })),
+          updatedAt: Date.now()
+        });
+        queue.textChannel?.send({
+          embeds: [ctx.makeEmbed("Now Playing", `**${song.name}**\n${song.url}`, "info")]
+        }).catch(() => {});
+      })
+      .on("addSong", (queue, song) => {
+        saveMusicQueueSnapshot(queue.textChannel?.guild?.id, {
+          voiceChannelId: queue.voiceChannel?.id || null,
+          textChannelId: queue.textChannel?.id || null,
+          nowPlaying: queue.songs[0] ? { name: queue.songs[0].name, url: queue.songs[0].url, duration: queue.songs[0].formattedDuration || null } : null,
+          queued: queue.songs.slice(1, 25).map(s => ({ name: s.name, url: s.url, duration: s.formattedDuration || null })),
+          updatedAt: Date.now()
+        });
+      })
+      .on("finish", queue => {
+        saveMusicQueueSnapshot(queue.textChannel?.guild?.id, {
+          voiceChannelId: queue.voiceChannel?.id || null,
+          textChannelId: queue.textChannel?.id || null,
+          nowPlaying: null,
+          queued: [],
+          updatedAt: Date.now()
+        });
+        queue.textChannel?.send({ embeds: [ctx.makeEmbed("Music Queue", "Queue finished.", "info")] }).catch(() => {});
+      })
+      .on("error", (channel, error) => {
+        channel?.send({ embeds: [ctx.makeEmbed("Music Error", String(error?.message || error || "Unknown music error"), "error")] }).catch(() => {});
+      });
+  }
+
   const profileFlushTimer = setInterval(() => {
     flushProfilesNow();
   }, 30000);
@@ -1141,6 +1266,19 @@ async function handleMemberRemove(member, ctx) {
 async function handleReactionAdd(reaction, user, ctx) {
   if (user.bot || !reaction.message.guild) return;
   const guildId = reaction.message.guild.id;
+  const roleMaps = load("reactionRoles", {});
+  const byGuild = roleMaps[guildId] || {};
+  const mapped = byGuild[reaction.message.id];
+  if (mapped) {
+    const reactionEmoji = reaction.emoji?.name || reaction.emoji?.toString?.() || "";
+    if (String(mapped.emoji) === String(reactionEmoji) || String(mapped.emoji) === String(reaction.emoji?.toString?.() || "")) {
+      const member = await reaction.message.guild.members.fetch(user.id).catch(() => null);
+      if (member && mapped.roleId) {
+        await member.roles.add(mapped.roleId).catch(() => {});
+      }
+    }
+  }
+
   const settings = getGuildSettings(guildId);
   if (!settings.starboard?.enabled) return;
   const expected = settings.starboard.emoji || "⭐";
@@ -1739,6 +1877,289 @@ async function handleCommand(interaction, ctx) {
       updateProfile(guildId, interaction.user.id, p => { p.currency -= amount; });
       updateProfile(guildId, target.id, p => { p.currency = (p.currency || 0) + amount; });
       await interaction.reply({ embeds: [ctx.makeEmbed("Payment Sent", `Paid ${amount} to ${target.tag}.`, "success")] });
+      return true;
+    }
+  }
+
+  if (cmd === "prestige") {
+    const confirm = interaction.options.getBoolean("confirm") === true;
+    if (!confirm) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Confirmation Required", "Set `confirm=true` to prestige.", "warn")], ephemeral: true });
+      return true;
+    }
+    const p = profile(guildId, interaction.user.id);
+    const currentBalance = Math.max(0, Number(p.currency || 0));
+    const bonus = Math.floor(currentBalance * 0.15);
+    updateProfile(guildId, interaction.user.id, x => { x.currency = bonus; });
+    const { all, item } = getGuildPrestige(guildId, interaction.user.id);
+    item.tier = Math.max(0, Number(item.tier || 0)) + 1;
+    item.totalPrestiges = Math.max(0, Number(item.totalPrestiges || 0)) + 1;
+    item.lastAt = Date.now();
+    item.lastResetAmount = currentBalance;
+    item.lastBonus = bonus;
+    save("prestige", all);
+    await interaction.reply({
+      embeds: [ctx.makeEmbed("Prestige Complete", `Tier: **${item.tier}**\nOld balance: **${currentBalance}**\n15% bonus restored: **${bonus}**`, "success")]
+    });
+    return true;
+  }
+
+  if (cmd === "achievements") {
+    const target = interaction.options.getUser("user") || interaction.user;
+    const p = profile(guildId, target.id);
+    const rows = getAchievementRows(p);
+    const unlocked = rows.filter(x => x.unlocked).length;
+    const text = rows.map(x => `${x.unlocked ? "✅" : "⬜"} ${x.name}`).join("\n");
+    await interaction.reply({
+      embeds: [ctx.makeEmbed("Achievements", `${target} unlocked **${unlocked}/${rows.length}**\n\n${text}`, "info")]
+    });
+    return true;
+  }
+
+  if (cmd === "shop") {
+    const action = interaction.options.getString("action");
+    const itemsAll = load("shopItems", {});
+    const items = ensureGuildMap(itemsAll, guildId);
+    const itemName = String(interaction.options.getString("item") || "").trim().toLowerCase();
+    const price = Math.max(1, interaction.options.getInteger("price") || 0);
+
+    if (action === "list") {
+      const rows = Object.entries(items).map(([key, val]) => `• **${key}** - ${val.price || 0} ${settings.economy?.currencyName || "Coins"}`);
+      await interaction.reply({ embeds: [ctx.makeEmbed("Shop", rows.length ? rows.join("\n") : "Shop is empty.", "info")] });
+      return true;
+    }
+
+    if (action === "add") {
+      if (!ctx.canUseModCommand(interaction.member)) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Staff only.", "error")], ephemeral: true });
+        return true;
+      }
+      if (!itemName || !price) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Missing Data", "Provide item and price.", "error")], ephemeral: true });
+        return true;
+      }
+      items[itemName] = { price, by: interaction.user.id, at: Date.now() };
+      save("shopItems", itemsAll);
+      await interaction.reply({ embeds: [ctx.makeEmbed("Shop Updated", `Added **${itemName}** for **${price}**.`, "success")], ephemeral: true });
+      return true;
+    }
+
+    if (action === "buy") {
+      if (!itemName || !items[itemName]) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Unknown Item", "Item not found in shop.", "error")], ephemeral: true });
+        return true;
+      }
+      const cost = Math.max(1, Number(items[itemName].price) || 1);
+      const p = profile(guildId, interaction.user.id);
+      if ((p.currency || 0) < cost) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Insufficient Funds", `You need ${cost} ${settings.economy?.currencyName || "Coins"}.`, "error")], ephemeral: true });
+        return true;
+      }
+      updateProfile(guildId, interaction.user.id, x => { x.currency -= cost; });
+      const invAll = load("inventories", {});
+      const inv = ensureInventory(invAll, guildId, interaction.user.id);
+      inv.push({ item: itemName, cost, at: Date.now() });
+      save("inventories", invAll);
+      await interaction.reply({ embeds: [ctx.makeEmbed("Purchase Complete", `Bought **${itemName}** for **${cost}**.`, "success")] });
+      return true;
+    }
+
+    if (action === "inventory") {
+      const invAll = load("inventories", {});
+      const inv = ensureInventory(invAll, guildId, interaction.user.id);
+      const rows = inv.slice(-20).reverse().map(x => `• ${x.item} (${x.cost})`).join("\n") || "No items.";
+      await interaction.reply({ embeds: [ctx.makeEmbed("Your Inventory", rows, "info")], ephemeral: true });
+      return true;
+    }
+  }
+
+  if (cmd === "games") {
+    const action = interaction.options.getString("action");
+    const bet = Math.max(1, interaction.options.getInteger("bet") || 0);
+    const p = profile(guildId, interaction.user.id);
+    if (!bet || (p.currency || 0) < bet) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Invalid Bet", "Bet must be positive and within your balance.", "error")], ephemeral: true });
+      return true;
+    }
+
+    if (action === "coinflip") {
+      const pick = String(interaction.options.getString("pick") || "").toLowerCase();
+      if (!["heads", "tails"].includes(pick)) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Missing Pick", "Choose heads or tails.", "error")], ephemeral: true });
+        return true;
+      }
+      const roll = Math.random() < 0.5 ? "heads" : "tails";
+      const win = pick === roll;
+      updateProfile(guildId, interaction.user.id, x => { x.currency = Math.max(0, (x.currency || 0) + (win ? bet : -bet)); });
+      await interaction.reply({ embeds: [ctx.makeEmbed("Coinflip", `Result: **${roll}**\n${win ? `You won ${bet}.` : `You lost ${bet}.`}`, win ? "success" : "warn")] });
+      return true;
+    }
+
+    if (action === "blackjack") {
+      const player = 12 + Math.floor(Math.random() * 10);
+      const dealer = 12 + Math.floor(Math.random() * 10);
+      const playerBust = player > 21;
+      const dealerBust = dealer > 21;
+      const win = (!playerBust && dealerBust) || (!playerBust && player > dealer);
+      const push = !playerBust && !dealerBust && player === dealer;
+      const delta = push ? 0 : (win ? bet : -bet);
+      updateProfile(guildId, interaction.user.id, x => { x.currency = Math.max(0, (x.currency || 0) + delta); });
+      await interaction.reply({
+        embeds: [ctx.makeEmbed(
+          "Blackjack",
+          `You: **${player}**\nDealer: **${dealer}**\n${push ? "Push. No change." : win ? `You won ${bet}.` : `You lost ${bet}.`}`,
+          push ? "info" : (win ? "success" : "warn")
+        )]
+      });
+      return true;
+    }
+  }
+
+  if (cmd === "fun") {
+    const action = interaction.options.getString("action");
+    if (action === "fortune") {
+      const fortunes = [
+        "A surprise opportunity is closer than you think.",
+        "Today is ideal for starting a small project.",
+        "Someone in this server is about to help you level up."
+      ];
+      const fortune = fortunes[Math.floor(Math.random() * fortunes.length)];
+      await interaction.reply({ embeds: [ctx.makeEmbed("Fortune", fortune, "info")] });
+      return true;
+    }
+    if (action === "pet") {
+      const pets = ["cat", "dog", "fox", "rabbit", "hamster"];
+      const pet = pets[Math.floor(Math.random() * pets.length)];
+      await interaction.reply({ embeds: [ctx.makeEmbed("Your Pet", `You adopted a **${pet}** today.`, "success")] });
+      return true;
+    }
+    if (action === "meme") {
+      const res = await fetch("https://meme-api.com/gimme").catch(() => null);
+      const data = res ? await res.json().catch(() => null) : null;
+      if (!data?.url) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Meme Error", "Could not fetch a meme right now.", "error")], ephemeral: true });
+        return true;
+      }
+      await interaction.reply({ embeds: [ctx.makeEmbed(data.title || "Random Meme", data.url, "info")] });
+      return true;
+    }
+  }
+
+  if (cmd === "utility") {
+    const action = interaction.options.getString("action");
+    if (action === "userinfo") {
+      const user = interaction.options.getUser("user") || interaction.user;
+      const memberObj = await interaction.guild.members.fetch(user.id).catch(() => null);
+      await interaction.reply({
+        embeds: [ctx.makeEmbed(`User Info: ${user.tag}`, `ID: ${user.id}`, "info", [
+          { name: "Created", value: `<t:${Math.floor(user.createdTimestamp / 1000)}:F>` },
+          { name: "Joined", value: memberObj ? `<t:${Math.floor(memberObj.joinedTimestamp / 1000)}:F>` : "Unknown" }
+        ])]
+      });
+      return true;
+    }
+    if (action === "weather") {
+      const location = interaction.options.getString("location");
+      if (!location) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Missing Location", "Provide a location.", "error")], ephemeral: true });
+        return true;
+      }
+      const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
+      const res = await fetch(url).catch(() => null);
+      const data = res ? await res.json().catch(() => null) : null;
+      const nowWeather = data?.current_condition?.[0];
+      if (!nowWeather) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Weather Error", "Could not fetch weather for that location.", "error")], ephemeral: true });
+        return true;
+      }
+      await interaction.reply({
+        embeds: [ctx.makeEmbed(`Weather: ${location}`, `Temp: **${nowWeather.temp_C}°C**\nCondition: **${nowWeather.weatherDesc?.[0]?.value || "Unknown"}**\nHumidity: **${nowWeather.humidity}%**`, "info")]
+      });
+      return true;
+    }
+    if (action === "convert") {
+      const amount = Number(interaction.options.getNumber("amount") || 1);
+      const from = String(interaction.options.getString("from") || "USD").toUpperCase();
+      const to = String(interaction.options.getString("to") || "EUR").toUpperCase();
+      const res = await fetch(`https://open.er-api.com/v6/latest/${encodeURIComponent(from)}`).catch(() => null);
+      const data = res ? await res.json().catch(() => null) : null;
+      const rate = Number(data?.rates?.[to] || 0);
+      if (!rate) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Conversion Error", "Invalid currency code or API unavailable.", "error")], ephemeral: true });
+        return true;
+      }
+      const converted = amount * rate;
+      await interaction.reply({ embeds: [ctx.makeEmbed("Currency Conversion", `${amount} ${from} = **${converted.toFixed(2)} ${to}**`, "info")] });
+      return true;
+    }
+  }
+
+  if (cmd === "media") {
+    const action = interaction.options.getString("action");
+    if (action === "embed") {
+      const title = interaction.options.getString("title") || "Embedded Media";
+      const url = interaction.options.getString("url");
+      if (!url) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Missing URL", "Provide URL for embed action.", "error")], ephemeral: true });
+        return true;
+      }
+      await interaction.reply({ embeds: [ctx.makeEmbed(title, url, "info")] });
+      return true;
+    }
+    const query = interaction.options.getString("query");
+    if (!query) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Missing Query", "Provide a search query.", "error")], ephemeral: true });
+      return true;
+    }
+    if (action === "image") {
+      const imageUrl = `https://source.unsplash.com/featured/?${encodeURIComponent(query)}`;
+      await interaction.reply({ embeds: [ctx.makeEmbed(`Image: ${query}`, imageUrl, "info")] });
+      return true;
+    }
+    if (action === "gif") {
+      const gifUrl = `https://giphy.com/search/${encodeURIComponent(query)}`;
+      await interaction.reply({ embeds: [ctx.makeEmbed(`GIF Search: ${query}`, gifUrl, "info")] });
+      return true;
+    }
+  }
+
+  if (cmd === "reactionroles") {
+    if (!ctx.canUseModCommand(interaction.member)) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Staff only.", "error")], ephemeral: true });
+      return true;
+    }
+    const emoji = interaction.options.getString("emoji");
+    const role = interaction.options.getRole("role");
+    const title = interaction.options.getString("title") || "Reaction Roles";
+    const msg = await interaction.channel.send({
+      embeds: [ctx.makeEmbed(title, `React with ${emoji} to get ${role}.`, "info")]
+    });
+    await msg.react(emoji).catch(() => {});
+    const all = load("reactionRoles", {});
+    const guildMap = ensureGuildMap(all, guildId);
+    guildMap[msg.id] = { emoji, roleId: role.id, by: interaction.user.id, at: Date.now() };
+    save("reactionRoles", all);
+    await interaction.reply({ embeds: [ctx.makeEmbed("Reaction Role Created", `Message ID: ${msg.id}`, "success")], ephemeral: true });
+    return true;
+  }
+
+  if (cmd === "music") {
+    const action = interaction.options.getString("action");
+    if (action === "status") {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Music Status", "Music playback is not wired yet. This command scaffold is ready for a Lavalink/DisTube player.", "info")] });
+      return true;
+    }
+    const query = interaction.options.getString("query") || "No query";
+    if (action === "play") {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Music Queue", `Queued: **${query}**\n(Scaffold mode - connect your music backend to enable playback.)`, "info")] });
+      return true;
+    }
+    if (action === "queue") {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Music Queue", "Queue viewing is scaffolded and ready for backend integration.", "info")] });
+      return true;
+    }
+    if (action === "stop") {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Music", "Stop requested (scaffold mode).", "warn")] });
       return true;
     }
   }

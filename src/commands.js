@@ -437,6 +437,159 @@ module.exports = [
     ]
   },
   {
+    name: "prestige",
+    description: "Reset balance for a prestige tier and bonus.",
+    options: [
+      {
+        name: "confirm",
+        type: 5,
+        required: true,
+        description: "Set true to confirm prestige reset"
+      }
+    ]
+  },
+  {
+    name: "shop",
+    description: "Shop, inventory, and item purchases.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "list/add/buy/inventory",
+        choices: [
+          { name: "list", value: "list" },
+          { name: "add", value: "add" },
+          { name: "buy", value: "buy" },
+          { name: "inventory", value: "inventory" }
+        ]
+      },
+      { name: "item", type: 3, required: false, description: "Item name" },
+      { name: "price", type: 4, required: false, description: "Item price (add action)" }
+    ]
+  },
+  {
+    name: "games",
+    description: "Simple economy games.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "coinflip/blackjack",
+        choices: [
+          { name: "coinflip", value: "coinflip" },
+          { name: "blackjack", value: "blackjack" }
+        ]
+      },
+      { name: "bet", type: 4, required: true, description: "Bet amount" },
+      {
+        name: "pick",
+        type: 3,
+        required: false,
+        description: "heads/tails for coinflip",
+        choices: [
+          { name: "heads", value: "heads" },
+          { name: "tails", value: "tails" }
+        ]
+      }
+    ]
+  },
+  {
+    name: "achievements",
+    description: "View progression achievements.",
+    options: [
+      { name: "user", type: 6, required: false, description: "Target user" }
+    ]
+  },
+  {
+    name: "fun",
+    description: "Fun commands (meme, fortune, pet).",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "meme/fortune/pet",
+        choices: [
+          { name: "meme", value: "meme" },
+          { name: "fortune", value: "fortune" },
+          { name: "pet", value: "pet" }
+        ]
+      }
+    ]
+  },
+  {
+    name: "utility",
+    description: "Utility info (weather/currency/userinfo).",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "weather/convert/userinfo",
+        choices: [
+          { name: "weather", value: "weather" },
+          { name: "convert", value: "convert" },
+          { name: "userinfo", value: "userinfo" }
+        ]
+      },
+      { name: "location", type: 3, required: false, description: "Weather location" },
+      { name: "amount", type: 10, required: false, description: "Amount for conversion" },
+      { name: "from", type: 3, required: false, description: "Currency code from (USD)" },
+      { name: "to", type: 3, required: false, description: "Currency code to (EUR)" },
+      { name: "user", type: 6, required: false, description: "Target user (userinfo)" }
+    ]
+  },
+  {
+    name: "media",
+    description: "Image/GIF/media search commands.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "image/gif/embed",
+        choices: [
+          { name: "image", value: "image" },
+          { name: "gif", value: "gif" },
+          { name: "embed", value: "embed" }
+        ]
+      },
+      { name: "query", type: 3, required: false, description: "Search query" },
+      { name: "url", type: 3, required: false, description: "URL for embed action" },
+      { name: "title", type: 3, required: false, description: "Title for embed action" }
+    ]
+  },
+  {
+    name: "reactionroles",
+    description: "Create reaction role message.",
+    options: [
+      { name: "emoji", type: 3, required: true, description: "Emoji to react with" },
+      { name: "role", type: 8, required: true, description: "Role to grant" },
+      { name: "title", type: 3, required: false, description: "Message title" }
+    ]
+  },
+  {
+    name: "music",
+    description: "Music status and controls scaffold.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "status/play/queue/stop",
+        choices: [
+          { name: "status", value: "status" },
+          { name: "play", value: "play" },
+          { name: "queue", value: "queue" },
+          { name: "stop", value: "stop" }
+        ]
+      },
+      { name: "query", type: 3, required: false, description: "Song or URL (play)" }
+    ]
+  },
+  {
     name: "suggestion",
     description: "Suggestion review and response.",
     options: [

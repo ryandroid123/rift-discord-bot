@@ -2064,16 +2064,31 @@ async function handleCommand(interaction, ctx) {
         await interaction.reply({ embeds: [ctx.makeEmbed("Missing Location", "Provide a location.", "error")], ephemeral: true });
         return true;
       }
-      const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
-      const res = await fetch(url).catch(() => null);
-      const data = res ? await res.json().catch(() => null) : null;
-      const nowWeather = data?.current_condition?.[0];
-      if (!nowWeather) {
-        await interaction.reply({ embeds: [ctx.makeEmbed("Weather Error", "Could not fetch weather for that location.", "error")], ephemeral: true });
+      const wait = isUtilityRateLimited(guildId, interaction.user.id, "weather", 7);
+      if (wait > 0) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Rate Limited", `Try again in ${wait}s.`, "warn")], ephemeral: true });
         return true;
       }
+      const cacheKey = location.trim().toLowerCase();
+      const cached = weatherCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        const nowWeather = cached.payload;
+        await interaction.reply({
+          embeds: [ctx.makeEmbed(`Weather: ${location}`, `Temp: **${nowWeather.temp_C} C**\nCondition: **${nowWeather.weatherDesc?.[0]?.value || "Unknown"}**\nHumidity: **${nowWeather.humidity}%**\n(source: cache)`, "info")]
+        });
+        return true;
+      }
+      const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
+      const res = await fetchWithTimeout(url, {}, 500).catch(() => null);
+      const data = res && res.ok ? await res.json().catch(() => null) : null;
+      const nowWeather = data?.current_condition?.[0];
+      if (!nowWeather) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Weather Unavailable", "Weather service timed out or is unavailable. Please try again shortly.", "warn")], ephemeral: true });
+        return true;
+      }
+      weatherCache.set(cacheKey, { payload: nowWeather, expiresAt: Date.now() + 60 * 1000 });
       await interaction.reply({
-        embeds: [ctx.makeEmbed(`Weather: ${location}`, `Temp: **${nowWeather.temp_C}°C**\nCondition: **${nowWeather.weatherDesc?.[0]?.value || "Unknown"}**\nHumidity: **${nowWeather.humidity}%**`, "info")]
+        embeds: [ctx.makeEmbed(`Weather: ${location}`, `Temp: **${nowWeather.temp_C} C**\nCondition: **${nowWeather.weatherDesc?.[0]?.value || "Unknown"}**\nHumidity: **${nowWeather.humidity}%**`, "info")]
       });
       return true;
     }
@@ -2081,11 +2096,25 @@ async function handleCommand(interaction, ctx) {
       const amount = Number(interaction.options.getNumber("amount") || 1);
       const from = String(interaction.options.getString("from") || "USD").toUpperCase();
       const to = String(interaction.options.getString("to") || "EUR").toUpperCase();
-      const res = await fetch(`https://open.er-api.com/v6/latest/${encodeURIComponent(from)}`).catch(() => null);
-      const data = res ? await res.json().catch(() => null) : null;
+      const wait = isUtilityRateLimited(guildId, interaction.user.id, "convert", 7);
+      if (wait > 0) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Rate Limited", `Try again in ${wait}s.`, "warn")], ephemeral: true });
+        return true;
+      }
+      const cached = rateCache.get(from);
+      let data = null;
+      if (cached && cached.expiresAt > Date.now()) {
+        data = cached.payload;
+      } else {
+        const res = await fetchWithTimeout(`https://open.er-api.com/v6/latest/${encodeURIComponent(from)}`, {}, 500).catch(() => null);
+        data = res && res.ok ? await res.json().catch(() => null) : null;
+        if (data?.rates) {
+          rateCache.set(from, { payload: data, expiresAt: Date.now() + 10 * 60 * 1000 });
+        }
+      }
       const rate = Number(data?.rates?.[to] || 0);
       if (!rate) {
-        await interaction.reply({ embeds: [ctx.makeEmbed("Conversion Error", "Invalid currency code or API unavailable.", "error")], ephemeral: true });
+        await interaction.reply({ embeds: [ctx.makeEmbed("Conversion Unavailable", "Invalid currency or rates unavailable right now.", "warn")], ephemeral: true });
         return true;
       }
       const converted = amount * rate;
@@ -2144,22 +2173,83 @@ async function handleCommand(interaction, ctx) {
   }
 
   if (cmd === "music") {
-    const action = interaction.options.getString("action");
-    if (action === "status") {
-      await interaction.reply({ embeds: [ctx.makeEmbed("Music Status", "Music playback is not wired yet. This command scaffold is ready for a Lavalink/DisTube player.", "info")] });
+    if (!distube) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Music Not Ready", "Player is initializing. Try again in a moment.", "warn")], ephemeral: true });
       return true;
     }
-    const query = interaction.options.getString("query") || "No query";
+    const action = interaction.options.getString("action");
+    const memberVoice = interaction.member?.voice?.channel;
+    const botVoice = interaction.guild.members.me?.voice?.channel;
+    const query = interaction.options.getString("query") || "";
+
+    if (["play", "stop"].includes(action) && !memberVoice) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Join Voice First", "You need to join a voice channel.", "warn")], ephemeral: true });
+      return true;
+    }
+    if (["play", "stop"].includes(action) && botVoice && memberVoice && botVoice.id !== memberVoice.id) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Wrong Voice Channel", "Join the same voice channel as the bot.", "warn")], ephemeral: true });
+      return true;
+    }
+    if (memberVoice) {
+      const perms = memberVoice.permissionsFor(interaction.guild.members.me);
+      if (!perms?.has("Connect") || !perms?.has("Speak")) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Missing Permissions", "I need Connect + Speak permissions in that voice channel.", "error")], ephemeral: true });
+        return true;
+      }
+    }
+
+    if (action === "status") {
+      const queue = distube.getQueue(interaction.guildId);
+      await interaction.reply({
+        embeds: [ctx.makeEmbed("Music Status", queue ? `Connected: <#${queue.voiceChannel?.id || "unknown"}>\nNow: **${queue.songs?.[0]?.name || "None"}**` : "No active queue.", "info")]
+      });
+      return true;
+    }
     if (action === "play") {
-      await interaction.reply({ embeds: [ctx.makeEmbed("Music Queue", `Queued: **${query}**\n(Scaffold mode - connect your music backend to enable playback.)`, "info")] });
+      if (!query) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Missing Query", "Provide a track name or URL.", "error")], ephemeral: true });
+        return true;
+      }
+      await interaction.deferReply();
+      try {
+        await distube.play(memberVoice, query, {
+          textChannel: interaction.channel,
+          member: interaction.member
+        });
+        await interaction.editReply({ embeds: [ctx.makeEmbed("Music", `Queued **${query}**`, "success")] });
+      } catch (err) {
+        await interaction.editReply({ embeds: [ctx.makeEmbed("Music Error", String(err?.message || err || "Failed to play"), "error")] });
+      }
       return true;
     }
     if (action === "queue") {
-      await interaction.reply({ embeds: [ctx.makeEmbed("Music Queue", "Queue viewing is scaffolded and ready for backend integration.", "info")] });
+      const queue = distube.getQueue(interaction.guildId);
+      if (!queue || !queue.songs?.length) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Music Queue", "Queue is empty.", "info")] });
+        return true;
+      }
+      const now = queue.songs[0];
+      const upcoming = queue.songs.slice(1, 11).map((s, i) => `${i + 1}. ${s.name}`).join("\n") || "None";
+      await interaction.reply({
+        embeds: [ctx.makeEmbed("Music Queue", `Now: **${now.name}**\n\nUp Next:\n${upcoming}`, "info")]
+      });
       return true;
     }
     if (action === "stop") {
-      await interaction.reply({ embeds: [ctx.makeEmbed("Music", "Stop requested (scaffold mode).", "warn")] });
+      const queue = distube.getQueue(interaction.guildId);
+      if (!queue) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Music", "No active queue.", "warn")], ephemeral: true });
+        return true;
+      }
+      queue.stop();
+      saveMusicQueueSnapshot(interaction.guildId, {
+        voiceChannelId: null,
+        textChannelId: interaction.channelId,
+        nowPlaying: null,
+        queued: [],
+        updatedAt: Date.now()
+      });
+      await interaction.reply({ embeds: [ctx.makeEmbed("Music", "Playback stopped and queue cleared.", "success")] });
       return true;
     }
   }
@@ -3063,3 +3153,4 @@ module.exports = {
   handleMemberRemove,
   handleReactionAdd
 };
+

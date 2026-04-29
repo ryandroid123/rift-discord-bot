@@ -2235,7 +2235,67 @@ const RIDDLE_ANSWERS = {
   "what has legs but doesn t walk": ["table", "a table"],
   "what can fill a room but takes up no space": ["light", "sunlight"],
   "what runs but never walks": ["water", "a river", "river"],
-  "what breaks yet never falls and what falls yet never breaks": ["day breaks and night falls", "day and night", "day breaks night falls"]
+  "what breaks yet never falls and what falls yet never breaks": ["day breaks and night falls", "day and night", "day breaks night falls"],
+  "what has to be broken before you can use it": ["egg", "an egg"],
+  "i am tall when i am young and short when i am old what am i": ["candle", "a candle"],
+  "what month of the year has 28 days": ["all of them", "all months", "every month"],
+  "what is always in front of you but can t be seen": ["the future", "future"],
+  "what can you break even if you never pick it up or touch it": ["a promise", "promise"],
+  "what goes up and down but doesn t move": ["stairs", "staircase"],
+  "a man who was outside in the rain without an umbrella or hat didn t get a single hair on his head wet why": ["he was bald", "he is bald", "bald"],
+  "what can you keep after giving to someone": ["your word", "a promise", "promise"],
+  "i shave every day but my beard stays the same what am i": ["barber", "a barber"],
+  "you see me once in june twice in november and not at all in may what am i": ["the letter e", "letter e", "e"],
+  "what can you hold in your left hand but not in your right": ["your right elbow", "right elbow"],
+  "what is black when it s clean and white when it s dirty": ["chalkboard", "blackboard", "a chalkboard"],
+  "what can you hear but not touch or see": ["your voice", "voice", "sound", "an echo", "echo"],
+  "what invention lets you look right through a wall": ["window", "a window"],
+  "what goes through cities and fields but never moves": ["road", "a road"],
+  "what has a thumb and four fingers but is not alive": ["glove", "a glove"],
+  "what has a head and a tail but no body": ["coin", "a coin"],
+  "what kind of room has no doors or windows": ["mushroom", "a mushroom"],
+  "what has four wheels and flies": ["garbage truck", "a garbage truck", "trash truck"],
+  "what has one eye one horn and gives milk": ["cow", "a cow"],
+  "what has lots of eyes but cannot see": ["potato", "a potato"],
+  "what has many needles but does not sew": ["pine tree", "a pine tree"],
+  "what has many branches but no fruit trunk or leaves": ["bank", "a bank"],
+  "what can run but never walks has a mouth but never talks has a head but never weeps has a bed but never sleeps": ["river", "a river"],
+  "what can clap without hands": ["thunder", "lightning", "thunderstorm"],
+  "what can be cracked made told and played": ["joke", "a joke"],
+  "what has no beginning end or middle": ["circle", "a circle", "ring"],
+  "what comes down but never goes up": ["rain", "snow", "rain and snow"],
+  "what can be as big as an elephant but weighs nothing": ["elephants shadow", "an elephants shadow", "shadow"],
+  "what gets sharper the more you use it": ["brain", "your mind", "mind"],
+  "what has a ring but no finger": ["phone", "a phone", "telephone"],
+  "what has one letter and starts with e and ends with e": ["envelope", "an envelope"],
+  "what can be measured but has no length width or height": ["time", "temperature"],
+  "what can you serve but never eat": ["tennis ball", "volleyball", "a tennis ball"],
+  "what can point in every direction but can t reach the destination by itself": ["compass", "a compass"],
+  "what kind of coat is always wet when you put it on": ["coat of paint", "paint"],
+  "what can go up a chimney down but can t go down a chimney up": ["umbrella", "an umbrella"],
+  "what is easy to lift but hard to throw": ["feather", "a feather"],
+  "what has a bottom at the top": ["legs", "your legs"],
+  "what has many rings but no fingers": ["telephone", "phone", "tree"],
+  "what has only two words but thousands of letters": ["post office", "a post office"],
+  "what kind of tree can you carry in your hand": ["palm", "a palm"],
+  "what can never be put in a saucepan": ["its lid", "a lid", "the lid"],
+  "what starts with a p ends with an e and has thousands of letters": ["post office", "a post office"],
+  "what has six faces but does not wear makeup has twenty one eyes but cannot see": ["dice", "a die", "die"],
+  "what can be seen in water but never gets wet": ["reflection", "your reflection"],
+  "what has no life but can die": ["battery", "a battery"],
+  "what has a bank but no money": ["river", "a river"],
+  "what comes once in a year twice in a week and never in a day": ["the letter e", "letter e", "e"],
+  "what is so fragile that saying its name breaks it": ["silence"],
+  "what can you put between 7 and 8 so the result is greater than 7 but less than 8": ["decimal point", "a decimal point", "."],
+  "what has one eye but can still cry": ["needle", "a needle"],
+  "what can be made of water but if you put it into water it dies": ["ice", "an ice cube", "ice cube"],
+  "what can never ask a question but is often answered": ["doorbell", "phone", "telephone"],
+  "what can you never eat for breakfast": ["lunch", "dinner"],
+  "what can you always find in the middle of nowhere": ["the letter h", "letter h", "h"],
+  "what has many stories but no pages": ["building", "a building"],
+  "what can jump higher than a building": ["anything", "everything", "a flea"],
+  "what has no body and no nose but can still smell": ["wind", "air"],
+  "what has no voice but can still tell you everything": ["book", "a book", "library"]
 };
 
 function normalizeRiddleText(value) {
@@ -2317,9 +2377,10 @@ async function handleRiddleGuess(message) {
 async function maybePostDailyRiddle() {
   const s = state();
   const now = londonNowParts();
-  if (s.lastRiddleDate === now.dateKey) return;
-  if (now.hour < config.riddle.hour) return;
-  if (now.hour === config.riddle.hour && now.minute < config.riddle.minute) return;
+  const intervalMinutes = Math.max(1, Number(config.riddle?.intervalMinutes) || 30);
+  const slot = Math.floor(((now.hour * 60) + now.minute) / intervalMinutes);
+  const slotKey = `${now.dateKey}:${slot}`;
+  if (s.lastRiddleSlot === slotKey) return;
 
   const r = config.riddle.riddles[Math.floor(Math.random() * config.riddle.riddles.length)];
   const answers = getRiddleAnswerSet(r);
@@ -2339,6 +2400,7 @@ async function maybePostDailyRiddle() {
     }).catch(() => null);
     s.riddleByGuild[guild.id] = {
       dateKey: now.dateKey,
+      slotKey,
       question: r,
       answers,
       winnerId: null,
@@ -2349,6 +2411,7 @@ async function maybePostDailyRiddle() {
   }
 
   s.lastRiddleDate = now.dateKey;
+  s.lastRiddleSlot = slotKey;
   saveState(s);
 }
 

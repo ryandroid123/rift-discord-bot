@@ -645,8 +645,8 @@ function getAutoModSettings() {
     blockedTerms: (automod.blockedTerms || []).map(x => String(x).toLowerCase()),
     suspiciousLinkPatterns: (automod.suspiciousLinkPatterns || []).map(x => String(x).toLowerCase()),
     maxMentions: automod.maxMentions ?? 5,
-    capsThreshold: automod.capsThreshold ?? 0.72,
-    capsMinLetters: automod.capsMinLetters ?? 12,
+    capsThreshold: automod.capsThreshold ?? 0.78,
+    capsMinLetters: automod.capsMinLetters ?? 16,
     maxEmoji: automod.maxEmoji ?? 10,
     maxLineBreaks: automod.maxLineBreaks ?? 10,
     maxChars: automod.maxChars ?? 1200,
@@ -716,6 +716,42 @@ function getMessageLinks(text) {
   return (matches || []).map(x => x.toLowerCase());
 }
 
+function getSuspiciousLinkEvidence(links = []) {
+  const shorteners = new Set([
+    "bit.ly", "t.co", "tinyurl.com", "goo.gl", "is.gd", "cutt.ly", "rb.gy", "shorturl.at"
+  ]);
+  const riskyTlds = new Set(["zip", "mov", "click", "top", "xyz", "gq", "tk", "work"]);
+
+  for (const rawLink of links) {
+    const cleaned = String(rawLink || "").trim();
+    if (!cleaned) continue;
+
+    if (cleaned.includes("@")) return `${cleaned} (contains @ in URL)`;
+    if (cleaned.includes("xn--")) return `${cleaned} (punycode hostname)`;
+
+    let parsed = null;
+    try {
+      parsed = new URL(cleaned);
+    } catch {
+      continue;
+    }
+
+    const host = String(parsed.hostname || "").toLowerCase();
+    if (!host) continue;
+    if (shorteners.has(host)) return `${cleaned} (URL shortener)`;
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return `${cleaned} (raw IP host)`;
+
+    const parts = host.split(".").filter(Boolean);
+    if (parts.length >= 5) return `${cleaned} (excessive subdomains)`;
+
+    const tld = parts[parts.length - 1] || "";
+    if (riskyTlds.has(tld)) return `${cleaned} (risky TLD .${tld})`;
+    if (/[^\x00-\x7F]/.test(host)) return `${cleaned} (non-ASCII hostname)`;
+  }
+
+  return null;
+}
+
 function getAttachmentFingerprints(message) {
   if (!message.attachments?.size) return [];
   return [...message.attachments.values()].map(a => `${a.name || "file"}:${a.size || 0}:${a.contentType || ""}`);
@@ -743,6 +779,7 @@ function detectSuspiciousUnicode(content) {
 function isAutoModBypassed(message, settings) {
   if (!settings.enabled) return true;
   if (!message.member) return true;
+  if (hasAnyRole(message.member, ["Head Moderator"])) return true;
   if (message.member.permissions.has(PermissionFlagsBits.Administrator)) return true;
   if (settings.whitelistUserIds.includes(message.author.id)) return true;
   if (settings.whitelistChannels.includes(message.channel.id)) return true;
@@ -857,13 +894,9 @@ function detectAutoModTrigger(message, settings, options = {}) {
     if (suspiciousPattern) {
       return { rule: "suspicious-link-pattern", reason: "Suspicious link pattern detected", evidence: suspiciousPattern };
     }
-    const riskyLink = links.find(link =>
-      link.includes("@") ||
-      link.includes("xn--") ||
-      /https?:\/\/[^\/]+\.(zip|mov|click)(\/|$)/i.test(link)
-    );
-    if (riskyLink) {
-      return { rule: "phishing-heuristic", reason: "Potential phishing link detected", evidence: riskyLink };
+    const suspiciousEvidence = getSuspiciousLinkEvidence(links);
+    if (suspiciousEvidence) {
+      return { rule: "phishing-heuristic", reason: "Potential malicious link detected", evidence: suspiciousEvidence };
     }
   }
 
@@ -1778,6 +1811,9 @@ function getProtectionImmunity(member, guild, settings = null) {
 
   if (hasAnyRole(member, ["Founder"])) {
     return { immune: true, reason: "founder-role" };
+  }
+  if (hasAnyRole(member, ["Head Moderator"])) {
+    return { immune: true, reason: "head-moderator-role" };
   }
 
   if (guild && member.id === guild.ownerId) {

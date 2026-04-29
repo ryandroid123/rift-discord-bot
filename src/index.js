@@ -75,7 +75,7 @@ ensureDataFile("giveaways.json", []);
 ensureDataFile("streams.json", []);
 ensureDataFile("warnings.json", {});
 ensureDataFile("antinuke.json", {});
-ensureDataFile("state.json", { lastRiddleDate: null, inviteCounts: [] });
+ensureDataFile("state.json", { lastRiddleDate: null, inviteCounts: [], riddleByGuild: {}, geniusByGuild: {} });
 ensureDataFile("afk.json", {});
 ensureDataFile("snipe.json", {});
 ensureDataFile("automod.json", {});
@@ -195,7 +195,7 @@ function transcriptChannel(guild) {
 }
 
 function state() {
-  return readJson(statePath, { lastRiddleDate: null, inviteCounts: [] });
+  return readJson(statePath, { lastRiddleDate: null, inviteCounts: [], riddleByGuild: {}, geniusByGuild: {} });
 }
 
 function saveState(value) {
@@ -2210,6 +2210,110 @@ function londonNowParts() {
   };
 }
 
+const RIDDLE_ANSWERS = {
+  "what has keys but can't open locks": ["keyboard", "a keyboard"],
+  "what gets wetter the more it dries": ["towel", "a towel"],
+  "what has hands but cannot clap": ["clock", "a clock"],
+  "the more you take the more you leave behind what am i": ["footsteps", "a footprint", "footprint"],
+  "what can travel around the world while staying in one corner": ["stamp", "a stamp", "postage stamp"],
+  "what has one eye but cannot see": ["needle", "a needle"],
+  "what is full of holes but still holds water": ["sponge", "a sponge"],
+  "what comes once in a minute twice in a moment but never in a thousand years": ["the letter m", "letter m", "m"],
+  "what has a neck but no head": ["bottle", "a bottle"],
+  "what has many teeth but cannot bite": ["comb", "a comb"],
+  "what goes up but never comes down": ["your age", "age"],
+  "what has one head one foot and four legs": ["bed", "a bed"],
+  "what has words but never speaks": ["book", "a book"],
+  "what kind of band never plays music": ["rubber band", "a rubber band"],
+  "what has cities but no houses forests but no trees and water but no fish": ["map", "a map"],
+  "what can you catch but not throw": ["cold", "a cold"],
+  "what begins with t ends with t and has t in it": ["teapot", "a teapot"],
+  "what belongs to you but other people use it more than you do": ["your name", "name", "my name"],
+  "what has an eye but cannot see": ["hurricane", "a hurricane", "storm", "a storm"],
+  "what gets bigger the more you take away from it": ["hole", "a hole"],
+  "what has 13 hearts but no other organs": ["deck of cards", "a deck of cards", "cards"],
+  "what has legs but doesn t walk": ["table", "a table"],
+  "what can fill a room but takes up no space": ["light", "sunlight"],
+  "what runs but never walks": ["water", "a river", "river"],
+  "what breaks yet never falls and what falls yet never breaks": ["day breaks and night falls", "day and night", "day breaks night falls"]
+};
+
+function normalizeRiddleText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getRiddleAnswerSet(question) {
+  const normalizedQuestion = normalizeRiddleText(question);
+  const variants = RIDDLE_ANSWERS[normalizedQuestion] || [];
+  const set = new Set(variants.map(normalizeRiddleText).filter(Boolean));
+  return [...set];
+}
+
+async function ensureGeniusRole(guild) {
+  let role = getRoleByName(guild, "Genius");
+  if (role) return role;
+  role = await guild.roles.create({
+    name: "Genius",
+    mentionable: true,
+    reason: "Auto-created for riddle streak winner role."
+  }).catch(() => null);
+  return role;
+}
+
+async function handleRiddleGuess(message) {
+  const s = state();
+  const guildRiddle = s.riddleByGuild?.[message.guild.id];
+  if (!guildRiddle || guildRiddle.winnerId) return;
+
+  const normalizedGuess = normalizeRiddleText(message.content);
+  if (!normalizedGuess) return;
+  const answers = Array.isArray(guildRiddle.answers) ? guildRiddle.answers : [];
+  if (!answers.includes(normalizedGuess)) return;
+
+  guildRiddle.winnerId = message.author.id;
+  guildRiddle.solvedAt = Date.now();
+  if (!s.geniusByGuild) s.geniusByGuild = {};
+
+  const previous = s.geniusByGuild[message.guild.id] || { userId: null, streak: 0 };
+  const sameWinner = previous.userId === message.author.id;
+  const nextStreak = sameWinner ? (Number(previous.streak) || 0) + 1 : 1;
+  s.geniusByGuild[message.guild.id] = {
+    userId: message.author.id,
+    streak: nextStreak,
+    updatedAt: Date.now()
+  };
+  saveState(s);
+
+  const geniusRole = await ensureGeniusRole(message.guild);
+  if (!geniusRole) return;
+
+  if (previous.userId && previous.userId !== message.author.id) {
+    const previousMember = await message.guild.members.fetch(previous.userId).catch(() => null);
+    if (previousMember?.roles?.cache?.has(geniusRole.id)) {
+      await previousMember.roles.remove(geniusRole, "Lost riddle streak").catch(() => {});
+    }
+  }
+
+  const winnerMember = message.member || await message.guild.members.fetch(message.author.id).catch(() => null);
+  if (winnerMember && !winnerMember.roles.cache.has(geniusRole.id)) {
+    await winnerMember.roles.add(geniusRole, "Won riddle first").catch(() => {});
+  }
+
+  await message.channel.send({
+    embeds: [
+      makeEmbed(
+        "Riddle Solved",
+        `${message.author} got it first and now has the **Genius** role.\nCurrent streak: **${nextStreak}**`,
+        "success"
+      )
+    ]
+  }).catch(() => {});
+}
+
 async function maybePostDailyRiddle() {
   const s = state();
   const now = londonNowParts();
@@ -2218,19 +2322,30 @@ async function maybePostDailyRiddle() {
   if (now.hour === config.riddle.hour && now.minute < config.riddle.minute) return;
 
   const r = config.riddle.riddles[Math.floor(Math.random() * config.riddle.riddles.length)];
+  const answers = getRiddleAnswerSet(r);
+  if (!s.riddleByGuild) s.riddleByGuild = {};
 
   for (const guild of client.guilds.cache.values()) {
     const ch = getChannelByName(guild, config.channels.chat);
     if (!ch) continue;
-    await ch.send({
+    const sent = await ch.send({
       embeds: [
         makeEmbed(
-          "🧩 Riddle of the Day",
+          "Riddle of the Day",
           `**Riddle:** ${r}\n\nReply in chat with your guess.`,
           "info"
         )
       ]
-    }).catch(() => {});
+    }).catch(() => null);
+    s.riddleByGuild[guild.id] = {
+      dateKey: now.dateKey,
+      question: r,
+      answers,
+      winnerId: null,
+      solvedAt: null,
+      messageId: sent?.id || null,
+      channelId: ch.id
+    };
   }
 
   s.lastRiddleDate = now.dateKey;
@@ -2481,6 +2596,7 @@ client.on(Events.MessageCreate, async message => {
     return { stop: false };
   });
   if (featureResult?.stop) return;
+  await handleRiddleGuess(message).catch(() => {});
 
   const settings = getAutoModSettings();
   const immunity = getProtectionImmunity(message.member, message.guild);
@@ -3848,4 +3964,5 @@ console.log("ABOUT TO LOGIN...");
 client.login(process.env.DISCORD_TOKEN)
   .then(() => console.log("LOGIN CALLED"))
   .catch(err => console.error("LOGIN ERROR:", err));
+
 

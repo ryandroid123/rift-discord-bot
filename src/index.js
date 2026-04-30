@@ -2309,7 +2309,25 @@ function normalizeRiddleText(value) {
 
 function getRiddleAnswerSet(question) {
   const normalizedQuestion = normalizeRiddleText(question);
-  const variants = RIDDLE_ANSWERS[normalizedQuestion] || [];
+  let variants = RIDDLE_ANSWERS[normalizedQuestion] || [];
+
+  if (!variants.length) {
+    const fallbackMatchers = [
+      { test: q => q.includes("gets wet while drying"), answers: ["towel", "a towel"] },
+      { test: q => q.includes("many keys") && q.includes("open"), answers: ["keyboard", "a keyboard"] },
+      { test: q => q.includes("face and two hands") || (q.includes("hands") && q.includes("no arms") && q.includes("no legs")), answers: ["clock", "a clock"] },
+      { test: q => q.includes("used for sewing") || (q.includes("one eye") && q.includes("sew")), answers: ["needle", "a needle"] },
+      { test: q => q.includes("cities but no houses"), answers: ["map", "a map"] },
+      { test: q => q.includes("forests but no trees"), answers: ["map", "a map"] },
+      { test: q => q.includes("water but no fish"), answers: ["map", "a map"] },
+      { test: q => q.includes("many teeth") && q.includes("can t bite"), answers: ["comb", "a comb"] },
+      { test: q => q.includes("travel all around the world") && q.includes("corner"), answers: ["stamp", "a stamp", "postage stamp"] },
+      { test: q => q.includes("fill a room") && q.includes("no space"), answers: ["light", "sunlight"] }
+    ];
+    const matched = fallbackMatchers.find(item => item.test(normalizedQuestion));
+    if (matched) variants = matched.answers;
+  }
+
   const set = new Set(variants.map(normalizeRiddleText).filter(Boolean));
   return [...set];
 }
@@ -2393,8 +2411,14 @@ async function maybePostDailyRiddle() {
   const slotKey = `${now.dateKey}:${slot}`;
   if (s.lastRiddleSlot === slotKey) return;
 
-  const r = config.riddle.riddles[Math.floor(Math.random() * config.riddle.riddles.length)];
-  const answers = getRiddleAnswerSet(r);
+  const candidateRiddles = (config.riddle.riddles || [])
+    .map(question => ({ question, answers: getRiddleAnswerSet(question) }))
+    .filter(item => item.answers.length > 0);
+  if (!candidateRiddles.length) return;
+
+  const picked = candidateRiddles[Math.floor(Math.random() * candidateRiddles.length)];
+  const r = picked.question;
+  const answers = picked.answers;
   if (!s.riddleByGuild) s.riddleByGuild = {};
 
   for (const guild of client.guilds.cache.values()) {
@@ -2403,7 +2427,7 @@ async function maybePostDailyRiddle() {
     const sent = await ch.send({
       embeds: [
         makeEmbed(
-          "Riddle of the Day",
+          "Riddle Challenge",
           `**Riddle:** ${r}\n\nReply in chat with your guess.`,
           "info"
         )

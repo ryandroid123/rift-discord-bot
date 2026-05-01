@@ -87,6 +87,7 @@ if (!fs.existsSync(transcriptDir)) fs.mkdirSync(transcriptDir, { recursive: true
 
 const automodCache = new Map();
 const giveawayTimers = new Map();
+const MAX_TIMER_MS = 2_147_000_000;
 const inviteCache = new Map();
 const memberInviteStats = new Map();
 const joinRaidCache = new Map();
@@ -1783,13 +1784,28 @@ async function endGiveaway(messageId) {
   }
 }
 function scheduleGiveaway(giveaway) {
-  const delay = Math.max(0, giveaway.endsAt - Date.now());
   if (giveawayTimers.has(giveaway.messageId)) {
     clearTimeout(giveawayTimers.get(giveaway.messageId));
   }
-  const timer = setTimeout(async () => {
-    await endGiveaway(giveaway.messageId);
-  }, delay);
+
+  const tick = async () => {
+    const remaining = Math.max(0, Number(giveaway.endsAt || 0) - Date.now());
+    if (remaining <= 0) {
+      await endGiveaway(giveaway.messageId);
+      return;
+    }
+
+    const nextDelay = Math.min(remaining, MAX_TIMER_MS);
+    const timer = setTimeout(() => {
+      tick().catch(() => {});
+    }, nextDelay);
+    if (typeof timer.unref === "function") timer.unref();
+    giveawayTimers.set(giveaway.messageId, timer);
+  };
+
+  const timer = setTimeout(() => {
+    tick().catch(() => {});
+  }, 0);
   if (typeof timer.unref === "function") timer.unref();
   giveawayTimers.set(giveaway.messageId, timer);
 }

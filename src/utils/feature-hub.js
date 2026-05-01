@@ -327,6 +327,21 @@ function randomXp(min, max) {
   return Math.max(min, Math.floor(Math.random() * (max - min + 1)) + min);
 }
 
+function parseDurationExtended(raw) {
+  const input = String(raw || "").trim().toLowerCase();
+  if (!input) return null;
+  const direct = ms(input);
+  if (direct) return direct;
+
+  const monthMatch = input.match(/^(\d+)\s*(mo|mos|month|months)$/i);
+  if (monthMatch) {
+    const n = Number(monthMatch[1]);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n * 30 * 24 * 60 * 60 * 1000;
+  }
+  return null;
+}
+
 function levelFromXp(xp) {
   return Math.floor(0.1 * Math.sqrt(Math.max(0, xp)));
 }
@@ -1420,9 +1435,9 @@ async function handleCommand(interaction, ctx) {
   if (cmd === "giveaway") {
     const duration = interaction.options.getString("duration");
     const prize = interaction.options.getString("prize");
-    const durationMs = ms(duration);
+    const durationMs = parseDurationExtended(duration);
     if (!durationMs) {
-      await interaction.reply({ embeds: [ctx.makeEmbed("Error", "Use a valid duration like 10m, 1h, or 1d.", "error")], ephemeral: true });
+      await interaction.reply({ embeds: [ctx.makeEmbed("Error", "Use a valid duration like 10m, 1h, 7d, or 1mo.", "error")], ephemeral: true });
       return true;
     }
 

@@ -245,7 +245,7 @@ module.exports = [
     name: "giveaway",
     description: "Create a giveaway in the current channel.",
     options: [
-      { name: "duration", type: 3, required: true, description: "10m, 1h, 1d" },
+      { name: "duration", type: 3, required: true, description: "10m, 1h, 1d, 1mo" },
       { name: "prize", type: 3, required: true, description: "Prize" },
       { name: "winners", type: 4, required: false, description: "Number of winners" },
       { name: "required_role", type: 8, required: false, description: "Role required to join" },

@@ -351,11 +351,12 @@ function runCommandControl(interaction) {
   const controlsAll = load("commandControls", {});
   const controls = controlsAll[guildId] || {};
   const command = interaction.commandName;
+  const giveawayCommands = new Set(["giveaway", "reroll", "giveawaymanage"]);
   const entries = controls[command];
   if (!entries) return null;
 
   if (entries.disabled === true) return "This command is currently disabled.";
-  if (Array.isArray(entries.channels) && entries.channels.length && !entries.channels.includes(interaction.channelId)) {
+  if (!giveawayCommands.has(command) && Array.isArray(entries.channels) && entries.channels.length && !entries.channels.includes(interaction.channelId)) {
     return "This command is restricted to specific channels.";
   }
   if (Array.isArray(entries.roles) && entries.roles.length) {

@@ -266,6 +266,19 @@ function parseRoleIdList(raw) {
   return out;
 }
 
+function parseNumberList(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return [];
+  const tokens = text.split(/[,\s]+/).map(t => t.trim()).filter(Boolean);
+  const out = [];
+  for (const token of tokens) {
+    const n = Number(token);
+    if (!Number.isFinite(n)) continue;
+    out.push(Math.max(0, Math.min(100, Math.floor(n))));
+  }
+  return out;
+}
+
 function normalizeGiveawayRecord(raw = {}) {
   const entries = normalizeIdList(raw.entries || []);
   const entryCounts = {};
@@ -3795,6 +3808,7 @@ client.on(Events.InteractionCreate, async interaction => {
         const blacklistRole = interaction.options.getRole("blacklist_role");
         const bonusRole = interaction.options.getRole("bonus_role");
         const bonusRolesRaw = interaction.options.getString("bonus_roles");
+        const bonusEntriesPerRoleRaw = interaction.options.getString("bonus_entries_per_role");
         const bonusEntriesCount = Math.max(0, Math.min(100, interaction.options.getInteger("bonus_entries") || 0));
         const requiredMessagesRaw = interaction.options.getInteger("required_messages");
         const messageWindowRaw = interaction.options.getString("message_window");
@@ -3832,9 +3846,26 @@ client.on(Events.InteractionCreate, async interaction => {
           bonusRole?.id || null,
           ...extraBonusRoleIds
         ]);
-        const bonusEntries = bonusEntriesCount > 0
-          ? allBonusRoleIds.map(roleId => ({ roleId, entries: bonusEntriesCount }))
-          : [];
+        const perRoleEntries = parseNumberList(bonusEntriesPerRoleRaw);
+        if (perRoleEntries.length && perRoleEntries.length !== allBonusRoleIds.length) {
+          await interaction.reply({
+            embeds: [makeEmbed("Error", "`bonus_entries_per_role` count must match total bonus roles provided.", "error")],
+            ephemeral: true
+          });
+          return;
+        }
+
+        const bonusEntries = [];
+        if (perRoleEntries.length) {
+          for (let i = 0; i < allBonusRoleIds.length; i += 1) {
+            const entries = perRoleEntries[i] || 0;
+            if (entries > 0) bonusEntries.push({ roleId: allBonusRoleIds[i], entries });
+          }
+        } else if (bonusEntriesCount > 0) {
+          for (const roleId of allBonusRoleIds) {
+            bonusEntries.push({ roleId, entries: bonusEntriesCount });
+          }
+        }
 
         const channel = interaction.channel;
         const endsAt = Date.now() + durationMs;

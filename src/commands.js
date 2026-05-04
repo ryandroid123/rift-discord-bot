@@ -253,6 +253,7 @@ module.exports = [
       { name: "bonus_role", type: 8, required: false, description: "Role with bonus entries" },
       { name: "bonus_roles", type: 3, required: false, description: "Extra bonus roles (mentions/IDs, comma separated)" },
       { name: "bonus_entries", type: 4, required: false, description: "Bonus entries for bonus role" },
+      { name: "bonus_entries_per_role", type: 3, required: false, description: "Per-role bonus entries list (e.g. 2,5,10)" },
       { name: "required_messages", type: 4, required: false, description: "Minimum messages required to enter" },
       { name: "message_window", type: 3, required: false, description: "Window like 1d, 2w, 14d, 1mo" }
     ]

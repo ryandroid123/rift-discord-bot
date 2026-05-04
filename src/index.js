@@ -250,6 +250,22 @@ function normalizeIdList(items) {
   return out;
 }
 
+function parseRoleIdList(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return [];
+  const tokens = text.split(/[,\s]+/).map(t => t.trim()).filter(Boolean);
+  const out = [];
+  const seen = new Set();
+  for (const token of tokens) {
+    const match = token.match(/^<@&(\d+)>$/) || token.match(/^(\d{6,})$/);
+    const id = match ? match[1] : "";
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 function normalizeGiveawayRecord(raw = {}) {
   const entries = normalizeIdList(raw.entries || []);
   const entryCounts = {};
@@ -3774,6 +3790,12 @@ client.on(Events.InteractionCreate, async interaction => {
         const duration = interaction.options.getString("duration");
         const prize = interaction.options.getString("prize");
         const durationMs = parseDurationExtended(duration);
+        const winners = Math.max(1, Math.min(25, interaction.options.getInteger("winners") || 1));
+        const requiredRole = interaction.options.getRole("required_role");
+        const blacklistRole = interaction.options.getRole("blacklist_role");
+        const bonusRole = interaction.options.getRole("bonus_role");
+        const bonusRolesRaw = interaction.options.getString("bonus_roles");
+        const bonusEntriesCount = Math.max(0, Math.min(100, interaction.options.getInteger("bonus_entries") || 0));
         const requiredMessagesRaw = interaction.options.getInteger("required_messages");
         const messageWindowRaw = interaction.options.getString("message_window");
 
@@ -3803,6 +3825,17 @@ client.on(Events.InteractionCreate, async interaction => {
           });
         }
 
+        const requiredRoleIds = requiredRole ? [requiredRole.id] : [];
+        const blacklistRoleIds = blacklistRole ? [blacklistRole.id] : [];
+        const extraBonusRoleIds = parseRoleIdList(bonusRolesRaw);
+        const allBonusRoleIds = normalizeIdList([
+          bonusRole?.id || null,
+          ...extraBonusRoleIds
+        ]);
+        const bonusEntries = bonusEntriesCount > 0
+          ? allBonusRoleIds.map(roleId => ({ roleId, entries: bonusEntriesCount }))
+          : [];
+
         const channel = interaction.channel;
         const endsAt = Date.now() + durationMs;
 
@@ -3830,8 +3863,14 @@ client.on(Events.InteractionCreate, async interaction => {
           hostId: interaction.user.id,
           prize,
           endsAt,
+          winners,
+          requiredRoleIds,
+          blacklistRoleIds,
+          bonusEntries,
           messageRequirement,
           entries: [],
+          entryCounts: {},
+          entrySnapshots: {},
           ended: false,
           winnerId: null
         };
@@ -4118,6 +4157,7 @@ if (cmd === "poll") {
         const messageId = interaction.customId.replace("join_giveaway_", "");
         const giveaways = loadGiveaways();
         const giveaway = giveaways.find(g => g.messageId === messageId);
+        const memberForEntry = interaction.member;
 
         if (!giveaway || giveaway.ended) {
           await interaction.reply({ embeds: [makeEmbed("Giveaway Ended", "This giveaway is no longer active.", "error")], ephemeral: true });
@@ -4127,6 +4167,22 @@ if (cmd === "poll") {
         if (giveaway.entries.includes(interaction.user.id)) {
           await interaction.reply({ embeds: [makeEmbed("Already Entered", "You already joined this giveaway.", "warn")], ephemeral: true });
           return;
+        }
+
+        if (Array.isArray(giveaway.requiredRoleIds) && giveaway.requiredRoleIds.length) {
+          const hasRequiredRole = giveaway.requiredRoleIds.some(roleId => memberForEntry?.roles?.cache?.has(roleId));
+          if (!hasRequiredRole) {
+            await interaction.reply({ embeds: [makeEmbed("Not Eligible", "You do not have the required role for this giveaway.", "warn")], ephemeral: true });
+            return;
+          }
+        }
+
+        if (Array.isArray(giveaway.blacklistRoleIds) && giveaway.blacklistRoleIds.length) {
+          const hasBlockedRole = giveaway.blacklistRoleIds.some(roleId => memberForEntry?.roles?.cache?.has(roleId));
+          if (hasBlockedRole) {
+            await interaction.reply({ embeds: [makeEmbed("Not Eligible", "You have a blocked role for this giveaway.", "warn")], ephemeral: true });
+            return;
+          }
         }
 
         if (giveaway.messageRequirement) {
@@ -4149,6 +4205,17 @@ if (cmd === "poll") {
         }
 
         giveaway.entries.push(interaction.user.id);
+        let entryCount = 1;
+        for (const bonus of giveaway.bonusEntries || []) {
+          const roleId = String(bonus?.roleId || "");
+          const bonusCount = Math.max(0, Math.min(100, Number(bonus?.entries) || 0));
+          if (!roleId || !bonusCount) continue;
+          if (memberForEntry?.roles?.cache?.has(roleId)) {
+            entryCount += bonusCount;
+          }
+        }
+        giveaway.entryCounts = giveaway.entryCounts && typeof giveaway.entryCounts === "object" ? giveaway.entryCounts : {};
+        giveaway.entryCounts[interaction.user.id] = Math.max(1, Math.min(500, entryCount));
         saveGiveaways(giveaways);
 
         const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);

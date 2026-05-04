@@ -251,6 +251,7 @@ module.exports = [
       { name: "required_role", type: 8, required: false, description: "Role required to join" },
       { name: "blacklist_role", type: 8, required: false, description: "Role blocked from joining" },
       { name: "bonus_role", type: 8, required: false, description: "Role with bonus entries" },
+      { name: "bonus_roles", type: 3, required: false, description: "Extra bonus roles (mentions/IDs, comma separated)" },
       { name: "bonus_entries", type: 4, required: false, description: "Bonus entries for bonus role" },
       { name: "required_messages", type: 4, required: false, description: "Minimum messages required to enter" },
       { name: "message_window", type: 3, required: false, description: "Window like 1d, 2w, 14d, 1mo" }

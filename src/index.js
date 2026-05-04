@@ -71,6 +71,7 @@ const moderationLogPath = resolveDataPath("moderation-log.json");
 const backupsPath = resolveDataPath("backups.json");
 const transcriptDir = resolveDataPath("transcripts");
 const ticketMetaPath = resolveDataPath("ticket-meta.json");
+const messageActivityPath = resolveDataPath("message-activity.json");
 
 ensureDataFile("giveaways.json", []);
 ensureDataFile("streams.json", []);
@@ -83,6 +84,7 @@ ensureDataFile("automod.json", {});
 ensureDataFile("moderation-log.json", []);
 ensureDataFile("backups.json", []);
 ensureDataFile("ticket-meta.json", {});
+ensureDataFile("message-activity.json", {});
 if (!fs.existsSync(transcriptDir)) fs.mkdirSync(transcriptDir, { recursive: true });
 
 const automodCache = new Map();
@@ -102,6 +104,7 @@ let afkCache = null;
 let startupCompleted = false;
 let shutdownFlushed = false;
 const AUTOMOD_WARNING_PREFIX = "AutoMod (";
+const MESSAGE_ACTIVITY_RETENTION_MS = 120 * 24 * 60 * 60 * 1000;
 
 function logRuntimeError(label, error) {
   if (!error) {
@@ -276,6 +279,7 @@ function normalizeGiveawayRecord(raw = {}) {
     requiredRoleIds: normalizeIdList(raw.requiredRoleIds || []),
     blacklistRoleIds: normalizeIdList(raw.blacklistRoleIds || []),
     bonusEntries: normalizeRoleRuleList(raw.bonusEntries || []),
+    messageRequirement: normalizeMessageRequirement(raw.messageRequirement),
     entries,
     entryCounts,
     entrySnapshots: raw.entrySnapshots && typeof raw.entrySnapshots === "object" ? raw.entrySnapshots : {},
@@ -370,6 +374,86 @@ function parseDurationExtended(raw) {
     return n * 30 * 24 * 60 * 60 * 1000;
   }
   return null;
+}
+
+function loadMessageActivity() {
+  const raw = readJson(messageActivityPath, {});
+  return raw && typeof raw === "object" ? raw : {};
+}
+
+function saveMessageActivity(data) {
+  writeJson(messageActivityPath, data && typeof data === "object" ? data : {});
+}
+
+function getHourBucket(ts = Date.now()) {
+  const d = new Date(ts);
+  d.setUTCMinutes(0, 0, 0);
+  return d.getTime();
+}
+
+function incrementMessageActivity(guildId, userId, ts = Date.now()) {
+  if (!guildId || !userId) return;
+  const all = loadMessageActivity();
+  const guildBucket = all[guildId] && typeof all[guildId] === "object" ? all[guildId] : {};
+  all[guildId] = guildBucket;
+  const userBucket = guildBucket[userId] && typeof guildBucket[userId] === "object" ? guildBucket[userId] : {};
+  guildBucket[userId] = userBucket;
+
+  const now = Number(ts) || Date.now();
+  const key = String(getHourBucket(now));
+  userBucket[key] = (Number(userBucket[key]) || 0) + 1;
+
+  const minAllowed = now - MESSAGE_ACTIVITY_RETENTION_MS;
+  for (const hourKey of Object.keys(userBucket)) {
+    const hourTs = Number(hourKey);
+    if (!Number.isFinite(hourTs) || hourTs < minAllowed) delete userBucket[hourKey];
+  }
+
+  saveMessageActivity(all);
+}
+
+function getUserMessagesInWindow(guildId, userId, windowMs, now = Date.now()) {
+  if (!guildId || !userId || !Number.isFinite(windowMs) || windowMs <= 0) return 0;
+  const all = loadMessageActivity();
+  const userBucket = all?.[guildId]?.[userId];
+  if (!userBucket || typeof userBucket !== "object") return 0;
+
+  const start = (Number(now) || Date.now()) - windowMs;
+  let total = 0;
+  for (const [hourKey, countRaw] of Object.entries(userBucket)) {
+    const hourTs = Number(hourKey);
+    if (!Number.isFinite(hourTs) || hourTs < start) continue;
+    total += Math.max(0, Number(countRaw) || 0);
+  }
+  return total;
+}
+
+function normalizeMessageRequirement(raw = null) {
+  if (!raw || typeof raw !== "object") return null;
+  const minMessages = Math.max(1, Math.min(100000, Number(raw.minMessages) || 0));
+  const windowMs = Number(raw.windowMs) || 0;
+  if (!minMessages || !windowMs) return null;
+  return { minMessages, windowMs };
+}
+
+function formatWindowLabel(windowMs) {
+  const days = windowMs / (24 * 60 * 60 * 1000);
+  const hours = windowMs / (60 * 60 * 1000);
+  if (Number.isInteger(days)) return `${days} day${days === 1 ? "" : "s"}`;
+  if (Number.isInteger(hours)) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  return `${Math.ceil(windowMs / (60 * 1000))} minutes`;
+}
+
+function buildGiveawayDescription(giveaway) {
+  const lines = [
+    `**Prize:** ${giveaway.prize}`,
+    `**Ends:** <t:${Math.floor(giveaway.endsAt / 1000)}:R>`,
+    `Entries: **${(giveaway.entries || []).length}**`
+  ];
+  if (giveaway.messageRequirement) {
+    lines.push(`**Requirement:** ${giveaway.messageRequirement.minMessages} messages in ${formatWindowLabel(giveaway.messageRequirement.windowMs)}`);
+  }
+  return lines.join("\n");
 }
 
 function currentConfig() {
@@ -2718,6 +2802,7 @@ client.on(Events.MessageCreate, async message => {
   if (!message.guild || message.author.bot) return;
   if (Date.now() - message.createdTimestamp > 15000) return;
   if (!message.content && !message.attachments?.size) return;
+  incrementMessageActivity(message.guild.id, message.author.id, message.createdTimestamp);
   governance.incrementAnalytics(message.guild.id, "messagesSeen", 1);
 
   const featureResult = await featureHub.handleMessageCreate(message, featureContext()).catch(err => {
@@ -3689,21 +3774,44 @@ client.on(Events.InteractionCreate, async interaction => {
         const duration = interaction.options.getString("duration");
         const prize = interaction.options.getString("prize");
         const durationMs = parseDurationExtended(duration);
+        const requiredMessagesRaw = interaction.options.getInteger("required_messages");
+        const messageWindowRaw = interaction.options.getString("message_window");
 
         if (!durationMs) {
           await interaction.reply({ embeds: [makeEmbed("Error", "Use a valid duration like 10m, 1h, 7d, or 1mo.", "error")], ephemeral: true });
           return;
         }
 
+        if ((requiredMessagesRaw && !messageWindowRaw) || (!requiredMessagesRaw && messageWindowRaw)) {
+          await interaction.reply({
+            embeds: [makeEmbed("Error", "Use both `required_messages` and `message_window` together.", "error")],
+            ephemeral: true
+          });
+          return;
+        }
+
+        let messageRequirement = null;
+        if (requiredMessagesRaw && messageWindowRaw) {
+          const windowMs = parseDurationExtended(messageWindowRaw);
+          if (!windowMs) {
+            await interaction.reply({ embeds: [makeEmbed("Error", "Use a valid `message_window` like 1d, 2w, 14d, or 1mo.", "error")], ephemeral: true });
+            return;
+          }
+          messageRequirement = normalizeMessageRequirement({
+            minMessages: requiredMessagesRaw,
+            windowMs
+          });
+        }
+
         const channel = interaction.channel;
         const endsAt = Date.now() + durationMs;
 
         const sent = await channel.send({
-          embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${prize}\n**Ends:** <t:${Math.floor(endsAt / 1000)}:R>\nEntries: **0**`, "info")]
+          embeds: [makeEmbed("Giveaway Started", buildGiveawayDescription({ prize, endsAt, entries: [], messageRequirement }), "info")]
         });
 
         await sent.edit({
-          embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${prize}\n**Ends:** <t:${Math.floor(endsAt / 1000)}:R>\nEntries: **0**`, "info")],
+          embeds: [makeEmbed("Giveaway Started", buildGiveawayDescription({ prize, endsAt, entries: [], messageRequirement }), "info")],
           components: [
             new ActionRowBuilder().addComponents(
               new ButtonBuilder()
@@ -3722,6 +3830,7 @@ client.on(Events.InteractionCreate, async interaction => {
           hostId: interaction.user.id,
           prize,
           endsAt,
+          messageRequirement,
           entries: [],
           ended: false,
           winnerId: null
@@ -4020,13 +4129,32 @@ if (cmd === "poll") {
           return;
         }
 
+        if (giveaway.messageRequirement) {
+          const currentCount = getUserMessagesInWindow(
+            interaction.guild.id,
+            interaction.user.id,
+            giveaway.messageRequirement.windowMs
+          );
+          if (currentCount < giveaway.messageRequirement.minMessages) {
+            await interaction.reply({
+              embeds: [makeEmbed(
+                "Not Eligible",
+                `You need **${giveaway.messageRequirement.minMessages}** messages in **${formatWindowLabel(giveaway.messageRequirement.windowMs)}** to join.\nCurrent progress: **${currentCount}**/${giveaway.messageRequirement.minMessages}.`,
+                "warn"
+              )],
+              ephemeral: true
+            });
+            return;
+          }
+        }
+
         giveaway.entries.push(interaction.user.id);
         saveGiveaways(giveaways);
 
         const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
         if (msg) {
           await msg.edit({
-            embeds: [makeEmbed("🎉 Giveaway Started", `**Prize:** ${giveaway.prize}\n**Ends:** <t:${Math.floor(giveaway.endsAt / 1000)}:R>\nEntries: **${giveaway.entries.length}**`, "info")],
+            embeds: [makeEmbed("Giveaway Started", buildGiveawayDescription(giveaway), "info")],
             components: msg.components
           }).catch(() => {});
         }
@@ -4093,5 +4221,4 @@ console.log("ABOUT TO LOGIN...");
 client.login(process.env.DISCORD_TOKEN)
   .then(() => console.log("LOGIN CALLED"))
   .catch(err => console.error("LOGIN ERROR:", err));
-
 

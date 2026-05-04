@@ -253,7 +253,7 @@ function normalizeIdList(items) {
 function parseRoleIdList(raw) {
   const text = String(raw || "").trim();
   if (!text) return [];
-  const tokens = text.split(/[,\s]+/).map(t => t.trim()).filter(Boolean);
+  const tokens = text.split(",").map(t => t.trim()).filter(Boolean);
   const out = [];
   const seen = new Set();
   for (const token of tokens) {
@@ -264,6 +264,48 @@ function parseRoleIdList(raw) {
     out.push(id);
   }
   return out;
+}
+
+function resolveRoleIdFromToken(guild, tokenRaw) {
+  const token = String(tokenRaw || "").trim();
+  if (!token) return null;
+
+  const match = token.match(/^<@&(\d+)>$/) || token.match(/^(\d{6,})$/);
+  if (match) return match[1];
+
+  const plain = token.replace(/^@+/, "").trim().toLowerCase();
+  if (!plain) return null;
+  const byName = guild.roles.cache.find(r => String(r.name || "").trim().toLowerCase() === plain);
+  return byName?.id || null;
+}
+
+function parseBonusRoleSpecs(raw, guild) {
+  const text = String(raw || "").trim();
+  if (!text) return { roleIds: [], inlineEntries: [] };
+
+  const tokens = text.split(",").map(t => t.trim()).filter(Boolean);
+  const roleIds = [];
+  const inlineEntries = [];
+  const seen = new Set();
+
+  for (const token of tokens) {
+    const idx = token.lastIndexOf(":");
+    const roleToken = idx > -1 ? token.slice(0, idx).trim() : token;
+    const entriesToken = idx > -1 ? token.slice(idx + 1).trim() : "";
+    const roleId = resolveRoleIdFromToken(guild, roleToken);
+    if (!roleId || seen.has(roleId)) continue;
+    seen.add(roleId);
+    roleIds.push(roleId);
+
+    if (entriesToken) {
+      const n = Number(entriesToken);
+      inlineEntries.push(Number.isFinite(n) ? Math.max(0, Math.min(100, Math.floor(n))) : 0);
+    } else {
+      inlineEntries.push(null);
+    }
+  }
+
+  return { roleIds, inlineEntries };
 }
 
 function parseNumberList(raw) {
@@ -1379,6 +1421,7 @@ function featureContext() {
     endGiveaway,
     pickGiveawayWinners,
     notifyGiveawayWinners,
+    getUserMessagesInWindow,
     loadBackups,
     sendTranscript,
     createTicket
@@ -3867,27 +3910,34 @@ client.on(Events.InteractionCreate, async interaction => {
 
         const requiredRoleIds = requiredRole ? [requiredRole.id] : [];
         const blacklistRoleIds = blacklistRole ? [blacklistRole.id] : [];
-        const extraBonusRoleIds = parseRoleIdList(bonusRolesRaw);
+        const bonusRoleSpec = parseBonusRoleSpecs(bonusRolesRaw, interaction.guild);
+        const extraBonusRoleIds = bonusRoleSpec.roleIds.length
+          ? bonusRoleSpec.roleIds
+          : parseRoleIdList(bonusRolesRaw);
         const allBonusRoleIds = normalizeIdList([
           bonusRole?.id || null,
           ...extraBonusRoleIds
         ]);
         const perRoleEntries = parseNumberList(bonusEntriesPerRoleRaw);
-        if (perRoleEntries.length && perRoleEntries.length !== allBonusRoleIds.length) {
+        const inlinePerRoleEntries = bonusRoleSpec.inlineEntries.some(x => x !== null)
+          ? bonusRoleSpec.inlineEntries.map(x => x === null ? 0 : x)
+          : [];
+        const effectivePerRoleEntries = perRoleEntries.length ? perRoleEntries : inlinePerRoleEntries;
+        if (effectivePerRoleEntries.length && effectivePerRoleEntries.length !== allBonusRoleIds.length) {
           await interaction.reply({
-            embeds: [makeEmbed("Error", "`bonus_entries_per_role` count must match total bonus roles provided.", "error")],
+            embeds: [makeEmbed("Error", "Per-role entry count must match total bonus roles provided.", "error")],
             ephemeral: true
           });
           return;
         }
-        if (allBonusRoleIds.length && !perRoleEntries.length && bonusEntriesCount <= 0) {
+        if (allBonusRoleIds.length && !effectivePerRoleEntries.length && bonusEntriesCount <= 0) {
           await interaction.reply({
-            embeds: [makeEmbed("Error", "Provide `bonus_entries` or `bonus_entries_per_role` when using bonus roles.", "error")],
+            embeds: [makeEmbed("Error", "Provide `bonus_entries`, `bonus_entries_per_role`, or use `bonus_roles` like `@Gold:10, @Silver:5`.", "error")],
             ephemeral: true
           });
           return;
         }
-        if (!allBonusRoleIds.length && (perRoleEntries.length || bonusEntriesCount > 0)) {
+        if (!allBonusRoleIds.length && (effectivePerRoleEntries.length || bonusEntriesCount > 0)) {
           await interaction.reply({
             embeds: [makeEmbed("Error", "Bonus entries were provided but no bonus roles were set.", "error")],
             ephemeral: true
@@ -3896,9 +3946,9 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         const bonusEntries = [];
-        if (perRoleEntries.length) {
+        if (effectivePerRoleEntries.length) {
           for (let i = 0; i < allBonusRoleIds.length; i += 1) {
-            const entries = perRoleEntries[i] || 0;
+            const entries = effectivePerRoleEntries[i] || 0;
             if (entries > 0) bonusEntries.push({ roleId: allBonusRoleIds[i], entries });
           }
         } else if (bonusEntriesCount > 0) {

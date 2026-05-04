@@ -40,7 +40,8 @@ const DATA_FILES = {
   inventories: "inventories.json",
   reactionRoles: "reaction-roles.json",
   musicQueues: "music-queues.json",
-  prestige: "prestige.json"
+  prestige: "prestige.json",
+  giveawayTemplates: "giveaway-templates.json"
 };
 
 const FILE_DEFAULTS = {
@@ -69,7 +70,8 @@ const FILE_DEFAULTS = {
   "inventories.json": {},
   "reaction-roles.json": {},
   "music-queues.json": {},
-  "prestige.json": {}
+  "prestige.json": {},
+  "giveaway-templates.json": {}
 };
 
 for (const file of Object.values(DATA_FILES)) {
@@ -284,7 +286,8 @@ function updateProfile(guildId, userId, updater) {
   const all = getProfilesData();
   const p = ensureProfile(all, guildId, userId);
   updater(p);
-  scheduleProfilesFlush();
+  profilesDirty = true;
+  flushProfilesNow();
   return p;
 }
 
@@ -342,6 +345,117 @@ function parseDurationExtended(raw) {
   return null;
 }
 
+function normalizeIdList(items) {
+  if (!Array.isArray(items)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const id = String(item || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function parseNumberList(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return [];
+  return text
+    .split(/[,\s]+/)
+    .map(token => Number(token.trim()))
+    .filter(n => Number.isFinite(n))
+    .map(n => Math.max(0, Math.min(100, Math.floor(n))));
+}
+
+function resolveRoleIdFromToken(guild, tokenRaw) {
+  const token = String(tokenRaw || "").trim();
+  if (!token) return null;
+  const match = token.match(/^<@&(\d+)>$/) || token.match(/^(\d{6,})$/);
+  if (match) return match[1];
+
+  const plain = token.replace(/^@+/, "").trim().toLowerCase();
+  if (!plain) return null;
+  const role = guild.roles.cache.find(r => String(r.name || "").trim().toLowerCase() === plain);
+  return role?.id || null;
+}
+
+function parseRoleIdList(raw, guild) {
+  const text = String(raw || "").trim();
+  if (!text) return [];
+  const seen = new Set();
+  const out = [];
+  for (const token of text.split(",").map(t => t.trim()).filter(Boolean)) {
+    const roleId = resolveRoleIdFromToken(guild, token);
+    if (!roleId || seen.has(roleId)) continue;
+    seen.add(roleId);
+    out.push(roleId);
+  }
+  return out;
+}
+
+function parseBonusRoleSpecs(raw, guild) {
+  const text = String(raw || "").trim();
+  if (!text) return { roleIds: [], inlineEntries: [], unknown: [] };
+  const seen = new Set();
+  const roleIds = [];
+  const inlineEntries = [];
+  const unknown = [];
+
+  for (const token of text.split(",").map(t => t.trim()).filter(Boolean)) {
+    const idx = token.lastIndexOf(":");
+    const roleToken = idx >= 0 ? token.slice(0, idx).trim() : token;
+    const entriesToken = idx >= 0 ? token.slice(idx + 1).trim() : "";
+    const roleId = resolveRoleIdFromToken(guild, roleToken);
+    if (!roleId) {
+      unknown.push(roleToken);
+      continue;
+    }
+    if (seen.has(roleId)) continue;
+    seen.add(roleId);
+    roleIds.push(roleId);
+
+    if (entriesToken) {
+      const n = Number(entriesToken);
+      inlineEntries.push(Number.isFinite(n) ? Math.max(0, Math.min(100, Math.floor(n))) : 0);
+    } else {
+      inlineEntries.push(null);
+    }
+  }
+
+  return { roleIds, inlineEntries, unknown };
+}
+
+function normalizeMessageRequirement(raw = null) {
+  if (!raw || typeof raw !== "object") return null;
+  const minMessages = Math.max(1, Math.min(100000, Number(raw.minMessages) || 0));
+  const windowMs = Number(raw.windowMs) || 0;
+  if (!minMessages || !windowMs) return null;
+  return { minMessages, windowMs };
+}
+
+function formatWindowLabel(windowMs) {
+  const days = windowMs / (24 * 60 * 60 * 1000);
+  const hours = windowMs / (60 * 60 * 1000);
+  if (Number.isInteger(days)) return `${days} day${days === 1 ? "" : "s"}`;
+  if (Number.isInteger(hours)) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  return `${Math.ceil(windowMs / (60 * 1000))} minutes`;
+}
+
+function templateKey(name) {
+  return String(name || "").trim().toLowerCase().replace(/\s+/g, "-").slice(0, 50);
+}
+
+function loadGiveawayTemplates(guildId) {
+  const all = load("giveawayTemplates", {});
+  if (!all[guildId]) all[guildId] = {};
+  return { all, templates: all[guildId] };
+}
+
+function saveGiveawayTemplates(all) {
+  save("giveawayTemplates", all || {});
+}
+
 function levelFromXp(xp) {
   return Math.floor(0.1 * Math.sqrt(Math.max(0, xp)));
 }
@@ -351,7 +465,7 @@ function runCommandControl(interaction) {
   const controlsAll = load("commandControls", {});
   const controls = controlsAll[guildId] || {};
   const command = interaction.commandName;
-  const giveawayCommands = new Set(["giveaway", "reroll", "giveawaymanage"]);
+  const giveawayCommands = new Set(["giveaway", "reroll", "giveawaymanage", "giveawaytemplate"]);
   const entries = controls[command];
   if (!entries) return null;
 
@@ -379,16 +493,190 @@ function formatGiveawaySummary(g) {
   const totalEntries = explicitCounts || (g.entries || []).length;
   const req = (g.requiredRoleIds || []).map(id => `<@&${id}>`).join(", ") || "None";
   const blk = (g.blacklistRoleIds || []).map(id => `<@&${id}>`).join(", ") || "None";
-  const bonus = (g.bonusEntries || []).map(b => `<@&${b.roleId}> (+${b.entries})`).join("\n") || "None";
+  const bonus = (g.bonusEntries || []).map(b => `<@&${b.roleId}>: +${b.entries}`).join("\n") || "None";
+  const messageReq = g.messageRequirement
+    ? `${g.messageRequirement.minMessages} messages in ${formatWindowLabel(g.messageRequirement.windowMs)}`
+    : "None";
   return [
     `**Prize:** ${g.prize}`,
     `**Ends:** <t:${Math.floor(g.endsAt / 1000)}:R>`,
     `**Winners:** ${g.winners || 1}`,
     `**Entries:** ${totalEntries} total from ${(g.entries || []).length} participant(s)`,
+    `**Required Messages:** ${messageReq}`,
     `**Required Roles:** ${req}`,
     `**Blacklisted Roles:** ${blk}`,
     `**Bonus Entries:** ${bonus}`
   ].join("\n");
+}
+
+function formatGiveawayTemplateSummary(t) {
+  const req = (t.requiredRoleIds || []).map(id => `<@&${id}>`).join(", ") || "None";
+  const blk = (t.blacklistRoleIds || []).map(id => `<@&${id}>`).join(", ") || "None";
+  const bonus = (t.bonusEntries || []).map(b => `<@&${b.roleId}>: +${b.entries}`).join("\n") || "None";
+  const messageReq = t.messageRequirement
+    ? `${t.messageRequirement.minMessages} messages in ${formatWindowLabel(t.messageRequirement.windowMs)}`
+    : "None";
+  return [
+    `**Template:** ${t.name}`,
+    `**Prize:** ${t.prize}`,
+    `**Duration:** ${formatWindowLabel(t.durationMs)}`,
+    `**Winners:** ${t.winners || 1}`,
+    `**Required Messages:** ${messageReq}`,
+    `**Required Roles:** ${req}`,
+    `**Blacklisted Roles:** ${blk}`,
+    `**Bonus Entries:** ${bonus}`
+  ].join("\n");
+}
+
+function buildGiveawayConfigFromInteraction(interaction, base = {}, options = {}) {
+  const errors = [];
+  const guild = interaction.guild;
+
+  const durationRaw = interaction.options.getString("duration");
+  const prizeRaw = interaction.options.getString("prize");
+  const durationMs = durationRaw ? parseDurationExtended(durationRaw) : Number(base.durationMs || 0);
+  const prize = String(prizeRaw || base.prize || "").trim();
+
+  if (options.requireDuration !== false && !durationMs) errors.push("Use a valid duration like 10m, 1h, 7d, or 1mo.");
+  if (options.requirePrize !== false && !prize) errors.push("Provide a prize.");
+  if (durationRaw && !durationMs) errors.push("Use a valid duration like 10m, 1h, 7d, or 1mo.");
+
+  const winnersOption = interaction.options.getInteger("winners");
+  const winners = Math.max(1, Math.min(25, winnersOption ?? base.winners ?? 1));
+  const requiredRole = interaction.options.getRole("required_role");
+  const blacklistRole = interaction.options.getRole("blacklist_role");
+  const requiredRoleIds = requiredRole ? [requiredRole.id] : normalizeIdList(base.requiredRoleIds || []);
+  const blacklistRoleIds = blacklistRole ? [blacklistRole.id] : normalizeIdList(base.blacklistRoleIds || []);
+
+  const bonusRole = interaction.options.getRole("bonus_role");
+  const bonusRolesRaw = interaction.options.getString("bonus_roles");
+  const bonusEntriesRaw = interaction.options.getInteger("bonus_entries");
+  const bonusEntriesPerRoleRaw = interaction.options.getString("bonus_entries_per_role");
+  const hasBonusInput = Boolean(bonusRole || bonusRolesRaw || bonusEntriesRaw !== null || bonusEntriesPerRoleRaw);
+  const hasBonusRoleInput = Boolean(bonusRole || bonusRolesRaw);
+
+  let bonusEntries = Array.isArray(base.bonusEntries) ? base.bonusEntries : [];
+  if (hasBonusInput) {
+    const specs = parseBonusRoleSpecs(bonusRolesRaw, guild);
+    if (specs.unknown.length) errors.push(`Unknown bonus role(s): ${specs.unknown.join(", ")}`);
+    const baseBonusRoleIds = normalizeIdList((base.bonusEntries || []).map(b => b.roleId));
+    const parsedBonusRoleIds = hasBonusRoleInput
+      ? (specs.roleIds.length ? specs.roleIds : parseRoleIdList(bonusRolesRaw, guild))
+      : baseBonusRoleIds;
+    const allBonusRoleIds = normalizeIdList([
+      bonusRole?.id || null,
+      ...parsedBonusRoleIds
+    ]);
+    const perRoleEntries = parseNumberList(bonusEntriesPerRoleRaw);
+    const inlinePerRoleEntries = specs.inlineEntries.some(x => x !== null)
+      ? specs.inlineEntries.map(x => x === null ? 0 : x)
+      : [];
+    const effectivePerRoleEntries = perRoleEntries.length ? perRoleEntries : inlinePerRoleEntries;
+    const sharedBonusEntries = Math.max(0, Math.min(100, bonusEntriesRaw || 0));
+
+    if (effectivePerRoleEntries.length && effectivePerRoleEntries.length !== allBonusRoleIds.length) {
+      errors.push("Per-role entry count must match the number of bonus roles.");
+    }
+    if (allBonusRoleIds.length && !effectivePerRoleEntries.length && sharedBonusEntries <= 0) {
+      errors.push("Provide bonus_entries, bonus_entries_per_role, or use bonus_roles like @Gold:10, @Silver:5.");
+    }
+    if (!allBonusRoleIds.length && (effectivePerRoleEntries.length || sharedBonusEntries > 0)) {
+      errors.push("Bonus entries were provided but no bonus roles were set.");
+    }
+
+    bonusEntries = [];
+    if (effectivePerRoleEntries.length) {
+      for (let i = 0; i < allBonusRoleIds.length; i += 1) {
+        const entries = effectivePerRoleEntries[i] || 0;
+        if (entries > 0) bonusEntries.push({ roleId: allBonusRoleIds[i], entries });
+      }
+    } else if (sharedBonusEntries > 0) {
+      for (const roleId of allBonusRoleIds) bonusEntries.push({ roleId, entries: sharedBonusEntries });
+    }
+  }
+
+  const requiredMessagesRaw = interaction.options.getInteger("required_messages");
+  const messageWindowRaw = interaction.options.getString("message_window");
+  let messageRequirement = normalizeMessageRequirement(base.messageRequirement);
+  if (requiredMessagesRaw !== null || messageWindowRaw) {
+    if (!requiredMessagesRaw || !messageWindowRaw) {
+      errors.push("Use required_messages and message_window together.");
+    } else {
+      const windowMs = parseDurationExtended(messageWindowRaw);
+      if (!windowMs) {
+        errors.push("Use a valid message_window like 1d, 2w, 14d, or 1mo.");
+      } else {
+        messageRequirement = normalizeMessageRequirement({ minMessages: requiredMessagesRaw, windowMs });
+      }
+    }
+  }
+
+  return {
+    errors,
+    config: {
+      prize,
+      durationMs,
+      winners,
+      requiredRoleIds,
+      blacklistRoleIds,
+      bonusEntries,
+      messageRequirement
+    }
+  };
+}
+
+async function postGiveawayFromConfig(interaction, ctx, config, options = {}) {
+  const endsAt = Date.now() + config.durationMs;
+  const sent = await interaction.channel.send({
+    embeds: [ctx.makeEmbed("Giveaway Started", "Preparing giveaway...", "info")]
+  });
+
+  const giveaway = {
+    messageId: sent.id,
+    channelId: interaction.channelId,
+    guildId: interaction.guild.id,
+    hostId: interaction.user.id,
+    prize: config.prize,
+    endsAt,
+    winners: config.winners,
+    requiredRoleIds: normalizeIdList(config.requiredRoleIds || []),
+    blacklistRoleIds: normalizeIdList(config.blacklistRoleIds || []),
+    bonusEntries: Array.isArray(config.bonusEntries) ? config.bonusEntries : [],
+    messageRequirement: normalizeMessageRequirement(config.messageRequirement),
+    templateName: options.templateName || null,
+    entries: [],
+    entryCounts: {},
+    entrySnapshots: {},
+    ended: false,
+    createdAt: Date.now(),
+    winnerId: null,
+    winnerIds: [],
+    rerollHistory: []
+  };
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`join_giveaway_${sent.id}`).setLabel("Join Giveaway").setStyle(ButtonStyle.Success)
+  );
+
+  await sent.edit({
+    embeds: [ctx.makeEmbed("Giveaway Started", formatGiveawaySummary(giveaway), "info")],
+    components: [row]
+  }).catch(() => {});
+
+  const giveaways = ctx.loadGiveaways();
+  giveaways.push(giveaway);
+  ctx.saveGiveaways(giveaways);
+  ctx.scheduleGiveaway(giveaway);
+
+  await ctx.sendLog(interaction.guild, "Giveaway Created", `${interaction.user.tag} created giveaway ${sent.id}.`, "info", [
+    { name: "Prize", value: giveaway.prize, inline: true },
+    { name: "Winners", value: String(giveaway.winners), inline: true },
+    { name: "Template", value: options.templateName || "None", inline: true },
+    { name: "Required Messages", value: giveaway.messageRequirement ? `${giveaway.messageRequirement.minMessages} / ${formatWindowLabel(giveaway.messageRequirement.windowMs)}` : "None" },
+    { name: "Bonus Entries", value: giveaway.bonusEntries.length ? giveaway.bonusEntries.map(b => `<@&${b.roleId}>:+${b.entries}`).join(" | ").slice(0, 1000) : "None" }
+  ]);
+  if (ctx.governance) ctx.governance.incrementAnalytics(interaction.guild.id, "giveawaysCreated", 1);
+  return giveaway;
 }
 
 function buildWeightedPool(giveaway, guild, options = {}) {
@@ -1364,6 +1652,25 @@ async function handleGiveawayJoin(interaction, ctx) {
     return true;
   }
 
+  if (giveaway.messageRequirement && typeof ctx.getUserMessagesInWindow === "function") {
+    const currentCount = ctx.getUserMessagesInWindow(
+      interaction.guild.id,
+      interaction.user.id,
+      giveaway.messageRequirement.windowMs
+    );
+    if (currentCount < giveaway.messageRequirement.minMessages) {
+      await interaction.reply({
+        embeds: [ctx.makeEmbed(
+          "Requirement Missing",
+          `You need **${giveaway.messageRequirement.minMessages}** messages in **${formatWindowLabel(giveaway.messageRequirement.windowMs)}** to join.\nCurrent progress: **${currentCount}**/${giveaway.messageRequirement.minMessages}.`,
+          "warn"
+        )],
+        ephemeral: true
+      });
+      return true;
+    }
+  }
+
   giveaway.entries.push(interaction.user.id);
   giveaway.entryCounts = giveaway.entryCounts || {};
   giveaway.entrySnapshots = giveaway.entrySnapshots || {};
@@ -1383,7 +1690,7 @@ async function handleGiveawayJoin(interaction, ctx) {
   const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
   if (msg) {
     await msg.edit({
-      embeds: [ctx.makeEmbed("🎉 Giveaway Started", formatGiveawaySummary(giveaway), "info")],
+      embeds: [ctx.makeEmbed("Giveaway Started", formatGiveawaySummary(giveaway), "info")],
       components: msg.components
     }).catch(() => {});
   }
@@ -1433,67 +1740,109 @@ async function handleCommand(interaction, ctx) {
     const reason = interaction.options.getString("reason") || "Closed via /close";
     return closeTicket(interaction, ctx, { reason, source: "slash-close", hardDelete: true });
   }
-  if (cmd === "giveaway") {
-    const duration = interaction.options.getString("duration");
-    const prize = interaction.options.getString("prize");
-    const durationMs = parseDurationExtended(duration);
-    if (!durationMs) {
-      await interaction.reply({ embeds: [ctx.makeEmbed("Error", "Use a valid duration like 10m, 1h, 7d, or 1mo.", "error")], ephemeral: true });
+  if (cmd === "giveawaytemplate") {
+    if (!ctx.canUseModCommand(interaction.member)) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("No Permission", "Only staff can manage giveaway templates.", "error")], ephemeral: true });
       return true;
     }
 
-    const winners = Math.max(1, Math.min(10, interaction.options.getInteger("winners") || 1));
-    const requiredRole = interaction.options.getRole("required_role");
-    const blacklistRole = interaction.options.getRole("blacklist_role");
-    const bonusRole = interaction.options.getRole("bonus_role");
-    const bonusEntries = Math.max(0, Math.min(20, interaction.options.getInteger("bonus_entries") || 0));
-    const endsAt = Date.now() + durationMs;
+    const action = String(interaction.options.getString("action") || "").toLowerCase();
+    const nameRaw = interaction.options.getString("name");
+    const key = templateKey(nameRaw);
+    const { all, templates } = loadGiveawayTemplates(guildId);
 
-    const sent = await interaction.channel.send({
-      embeds: [ctx.makeEmbed("🎉 Giveaway Started", "Preparing giveaway...", "info")]
+    if (action === "list") {
+      const rows = Object.values(templates)
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+        .map(t => `**${t.name}** - ${t.prize} (${formatWindowLabel(t.durationMs)}, ${t.winners || 1} winner${Number(t.winners || 1) === 1 ? "" : "s"})`)
+        .slice(0, 25)
+        .join("\n") || "No giveaway templates saved.";
+      await interaction.reply({ embeds: [ctx.makeEmbed("Giveaway Templates", rows, "info")], ephemeral: true });
+      return true;
+    }
+
+    if (!key) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Missing Name", "Provide a template name.", "error")], ephemeral: true });
+      return true;
+    }
+
+    const existing = templates[key] || null;
+    if (action === "info") {
+      if (!existing) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Not Found", "No template exists with that name.", "error")], ephemeral: true });
+        return true;
+      }
+      await interaction.reply({ embeds: [ctx.makeEmbed("Giveaway Template", formatGiveawayTemplateSummary(existing), "info")], ephemeral: true });
+      return true;
+    }
+
+    if (action === "delete") {
+      if (!existing) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Not Found", "No template exists with that name.", "error")], ephemeral: true });
+        return true;
+      }
+      delete templates[key];
+      saveGiveawayTemplates(all);
+      await interaction.reply({ embeds: [ctx.makeEmbed("Template Deleted", `Deleted template **${existing.name}**.`, "success")], ephemeral: true });
+      return true;
+    }
+
+    if (action === "save") {
+      const { errors, config } = buildGiveawayConfigFromInteraction(interaction, existing || {}, {
+        requireDuration: true,
+        requirePrize: true
+      });
+      if (errors.length) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Template Error", errors.join("\n"), "error")], ephemeral: true });
+        return true;
+      }
+      templates[key] = {
+        ...config,
+        name: String(nameRaw).trim(),
+        key,
+        guildId,
+        updatedAt: Date.now(),
+        updatedBy: interaction.user.id,
+        createdAt: existing?.createdAt || Date.now(),
+        createdBy: existing?.createdBy || interaction.user.id
+      };
+      saveGiveawayTemplates(all);
+      await interaction.reply({ embeds: [ctx.makeEmbed("Template Saved", formatGiveawayTemplateSummary(templates[key]), "success")], ephemeral: true });
+      return true;
+    }
+
+    if (action === "post") {
+      if (!existing) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Not Found", "No template exists with that name.", "error")], ephemeral: true });
+        return true;
+      }
+      const { errors, config } = buildGiveawayConfigFromInteraction(interaction, existing, {
+        requireDuration: true,
+        requirePrize: true
+      });
+      if (errors.length) {
+        await interaction.reply({ embeds: [ctx.makeEmbed("Giveaway Error", errors.join("\n"), "error")], ephemeral: true });
+        return true;
+      }
+      const giveaway = await postGiveawayFromConfig(interaction, ctx, config, { templateName: existing.name });
+      await interaction.reply({ embeds: [ctx.makeEmbed("Giveaway Created", `Posted template **${existing.name}** in ${interaction.channel}.\nMessage ID: \`${giveaway.messageId}\``, "success")], ephemeral: true });
+      return true;
+    }
+
+    return true;
+  }
+
+  if (cmd === "giveaway") {
+    const { errors, config } = buildGiveawayConfigFromInteraction(interaction, {}, {
+      requireDuration: true,
+      requirePrize: true
     });
-
-    const giveaway = {
-      messageId: sent.id,
-      channelId: interaction.channelId,
-      guildId,
-      hostId: interaction.user.id,
-      prize,
-      endsAt,
-      winners,
-      requiredRoleIds: requiredRole ? [requiredRole.id] : [],
-      blacklistRoleIds: blacklistRole ? [blacklistRole.id] : [],
-      bonusEntries: bonusRole && bonusEntries > 0 ? [{ roleId: bonusRole.id, entries: bonusEntries }] : [],
-      entries: [],
-      entryCounts: {},
-      entrySnapshots: {},
-      ended: false,
-      createdAt: Date.now(),
-      winnerId: null,
-      winnerIds: [],
-      rerollHistory: []
-    };
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`join_giveaway_${sent.id}`).setLabel("Join Giveaway").setStyle(ButtonStyle.Success)
-    );
-
-    await sent.edit({
-      embeds: [ctx.makeEmbed("🎉 Giveaway Started", formatGiveawaySummary(giveaway), "info")],
-      components: [row]
-    }).catch(() => {});
-
-    const giveaways = ctx.loadGiveaways();
-    giveaways.push(giveaway);
-    ctx.saveGiveaways(giveaways);
-    ctx.scheduleGiveaway(giveaway);
-
-    await interaction.reply({ embeds: [ctx.makeEmbed("Giveaway Created", `Posted in ${interaction.channel}.`, "success")], ephemeral: true });
-    await ctx.sendLog(interaction.guild, "Giveaway Created", `${interaction.user.tag} created giveaway ${sent.id}.`, "info", [
-      { name: "Prize", value: prize, inline: true },
-      { name: "Winners", value: String(winners), inline: true }
-    ]);
-    if (ctx.governance) ctx.governance.incrementAnalytics(guildId, "giveawaysCreated", 1);
+    if (errors.length) {
+      await interaction.reply({ embeds: [ctx.makeEmbed("Giveaway Error", errors.join("\n"), "error")], ephemeral: true });
+      return true;
+    }
+    const giveaway = await postGiveawayFromConfig(interaction, ctx, config);
+    await interaction.reply({ embeds: [ctx.makeEmbed("Giveaway Created", `Posted in ${interaction.channel}.\nMessage ID: \`${giveaway.messageId}\``, "success")], ephemeral: true });
     return true;
   }
 

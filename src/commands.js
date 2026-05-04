@@ -251,8 +251,8 @@ module.exports = [
       { name: "required_role", type: 8, required: false, description: "Role required to join" },
       { name: "blacklist_role", type: 8, required: false, description: "Role blocked from joining" },
       { name: "bonus_role", type: 8, required: false, description: "Role with bonus entries" },
-      { name: "bonus_roles", type: 3, required: false, description: "Extra bonus roles (mentions/IDs, comma separated)" },
-      { name: "bonus_entries", type: 4, required: false, description: "Bonus entries for bonus role" },
+      { name: "bonus_roles", type: 3, required: false, description: "Bonus roles, e.g. @Gold:10, @Silver:5" },
+      { name: "bonus_entries", type: 4, required: false, description: "Shared bonus entries for all bonus roles" },
       { name: "bonus_entries_per_role", type: 3, required: false, description: "Per-role bonus entries list (e.g. 2,5,10)" },
       { name: "required_messages", type: 4, required: false, description: "Minimum messages required to enter" },
       { name: "message_window", type: 3, required: false, description: "Window like 1d, 2w, 14d, 1mo" }
@@ -262,6 +262,37 @@ module.exports = [
     name: "reroll",
     description: "Reroll a giveaway.",
     options: [{ name: "messageid", type: 3, required: true, description: "Giveaway message ID" }]
+  },
+  {
+    name: "giveawaytemplate",
+    description: "Save, list, delete, info, or post giveaway templates.",
+    options: [
+      {
+        name: "action",
+        type: 3,
+        required: true,
+        description: "save/list/delete/info/post",
+        choices: [
+          { name: "save", value: "save" },
+          { name: "list", value: "list" },
+          { name: "delete", value: "delete" },
+          { name: "info", value: "info" },
+          { name: "post", value: "post" }
+        ]
+      },
+      { name: "name", type: 3, required: false, description: "Template name" },
+      { name: "duration", type: 3, required: false, description: "10m, 1h, 1d, 1mo" },
+      { name: "prize", type: 3, required: false, description: "Prize" },
+      { name: "winners", type: 4, required: false, description: "Number of winners" },
+      { name: "required_role", type: 8, required: false, description: "Role required to join" },
+      { name: "blacklist_role", type: 8, required: false, description: "Role blocked from joining" },
+      { name: "bonus_role", type: 8, required: false, description: "Role with bonus entries" },
+      { name: "bonus_roles", type: 3, required: false, description: "Bonus roles, e.g. @Gold:10, @Silver:5" },
+      { name: "bonus_entries", type: 4, required: false, description: "Shared bonus entries for all bonus roles" },
+      { name: "bonus_entries_per_role", type: 3, required: false, description: "Per-role bonus entries list (e.g. 2,5,10)" },
+      { name: "required_messages", type: 4, required: false, description: "Minimum messages required to enter" },
+      { name: "message_window", type: 3, required: false, description: "Window like 1d, 2w, 14d, 1mo" }
+    ]
   },
   {
     name: "userinfo",

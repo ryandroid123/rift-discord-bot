@@ -474,15 +474,41 @@ function formatWindowLabel(windowMs) {
 }
 
 function buildGiveawayDescription(giveaway) {
+  const winnerCount = Math.max(1, Number(giveaway.winners) || 1);
+  const requiredRoles = (giveaway.requiredRoleIds || []).map(id => `<@&${id}>`);
+  const blockedRoles = (giveaway.blacklistRoleIds || []).map(id => `<@&${id}>`);
+  const bonusRoleRules = (giveaway.bonusEntries || [])
+    .map(rule => {
+      const roleId = String(rule?.roleId || "");
+      const entries = Math.max(0, Number(rule?.entries) || 0);
+      if (!roleId || entries <= 0) return null;
+      return `<@&${roleId}>: +${entries}`;
+    })
+    .filter(Boolean);
+
   const lines = [
     `**Prize:** ${giveaway.prize}`,
     `**Ends:** <t:${Math.floor(giveaway.endsAt / 1000)}:R>`,
+    `**Winners:** ${winnerCount}`,
     `Entries: **${(giveaway.entries || []).length}**`
   ];
   if (giveaway.messageRequirement) {
     lines.push(`**Requirement:** ${giveaway.messageRequirement.minMessages} messages in ${formatWindowLabel(giveaway.messageRequirement.windowMs)}`);
   }
+  if (requiredRoles.length) {
+    lines.push(`**Required Roles:** ${requiredRoles.join(", ")}`);
+  }
+  if (blockedRoles.length) {
+    lines.push(`**Blocked Roles:** ${blockedRoles.join(", ")}`);
+  }
+  if (bonusRoleRules.length) {
+    lines.push(`**Bonus Roles:** ${bonusRoleRules.join(" | ")}`);
+  }
   return lines.join("\n");
+}
+
+function buildGiveawayEndedDescription(giveaway, winnerText) {
+  return `${buildGiveawayDescription(giveaway)}\n**Winner(s):** ${winnerText}`;
 }
 
 function currentConfig() {
@@ -1866,13 +1892,13 @@ async function endGiveaway(messageId) {
     const msg = await channel.messages.fetch(giveaway.messageId).catch(() => null);
     if (msg) {
       await msg.edit({
-        embeds: [makeEmbed("Giveaway Ended", `**Prize:** ${giveaway.prize}\n**Winner(s):** ${winnerText}`, "success")],
+        embeds: [makeEmbed("Giveaway Ended", buildGiveawayEndedDescription(giveaway, winnerText), "success")],
         components: []
       }).catch(() => {});
     }
 
     await channel.send({
-      embeds: [makeEmbed("Giveaway Finished", `**Prize:** ${giveaway.prize}\n**Winner(s):** ${winnerText}`, "success") ]
+      embeds: [makeEmbed("Giveaway Finished", buildGiveawayEndedDescription(giveaway, winnerText), "success") ]
     }).catch(() => {});
   }
 
@@ -3854,6 +3880,20 @@ client.on(Events.InteractionCreate, async interaction => {
           });
           return;
         }
+        if (allBonusRoleIds.length && !perRoleEntries.length && bonusEntriesCount <= 0) {
+          await interaction.reply({
+            embeds: [makeEmbed("Error", "Provide `bonus_entries` or `bonus_entries_per_role` when using bonus roles.", "error")],
+            ephemeral: true
+          });
+          return;
+        }
+        if (!allBonusRoleIds.length && (perRoleEntries.length || bonusEntriesCount > 0)) {
+          await interaction.reply({
+            embeds: [makeEmbed("Error", "Bonus entries were provided but no bonus roles were set.", "error")],
+            ephemeral: true
+          });
+          return;
+        }
 
         const bonusEntries = [];
         if (perRoleEntries.length) {
@@ -3870,12 +3910,23 @@ client.on(Events.InteractionCreate, async interaction => {
         const channel = interaction.channel;
         const endsAt = Date.now() + durationMs;
 
+        const previewGiveaway = {
+          prize,
+          endsAt,
+          winners,
+          entries: [],
+          requiredRoleIds,
+          blacklistRoleIds,
+          bonusEntries,
+          messageRequirement
+        };
+
         const sent = await channel.send({
-          embeds: [makeEmbed("Giveaway Started", buildGiveawayDescription({ prize, endsAt, entries: [], messageRequirement }), "info")]
+          embeds: [makeEmbed("Giveaway Started", buildGiveawayDescription(previewGiveaway), "info")]
         });
 
         await sent.edit({
-          embeds: [makeEmbed("Giveaway Started", buildGiveawayDescription({ prize, endsAt, entries: [], messageRequirement }), "info")],
+          embeds: [makeEmbed("Giveaway Started", buildGiveawayDescription(previewGiveaway), "info")],
           components: [
             new ActionRowBuilder().addComponents(
               new ButtonBuilder()
@@ -3912,7 +3963,12 @@ client.on(Events.InteractionCreate, async interaction => {
 
         await interaction.reply({ embeds: [makeEmbed("Giveaway Created", `Your giveaway was posted in ${channel}.`, "success")], ephemeral: true });
         await sendLog(interaction.guild, "Giveaway Created", `${interaction.user.tag} created a giveaway.`, "info", [
-          { name: "Prize", value: prize }
+          { name: "Prize", value: prize, inline: true },
+          { name: "Winners", value: String(winners), inline: true },
+          { name: "Requirement", value: messageRequirement ? `${messageRequirement.minMessages} msgs / ${formatWindowLabel(messageRequirement.windowMs)}` : "None", inline: true },
+          { name: "Required Roles", value: requiredRoleIds.length ? requiredRoleIds.map(id => `<@&${id}>`).join(", ") : "None" },
+          { name: "Blocked Roles", value: blacklistRoleIds.length ? blacklistRoleIds.map(id => `<@&${id}>`).join(", ") : "None" },
+          { name: "Bonus Roles", value: bonusEntries.length ? bonusEntries.map(b => `<@&${b.roleId}>:+${b.entries}`).join(" | ").slice(0, 1000) : "None" }
         ]);
         return;
       }
@@ -3937,16 +3993,26 @@ client.on(Events.InteractionCreate, async interaction => {
           return;
         }
 
-        const winnerId = giveaway.entries[Math.floor(Math.random() * giveaway.entries.length)];
-        giveaway.winnerId = winnerId;
+        const rerolledWinners = pickGiveawayWinners(giveaway, interaction.guild, { excludeUserIds: [] });
+        if (!rerolledWinners.length) {
+          await interaction.reply({ embeds: [makeEmbed("Error", "Could not pick reroll winner(s).", "error")], ephemeral: true });
+          return;
+        }
+        giveaway.winnerId = rerolledWinners[0];
+        giveaway.winnerIds = rerolledWinners;
+        giveaway.rerollHistory = Array.isArray(giveaway.rerollHistory) ? giveaway.rerollHistory : [];
+        giveaway.rerollHistory.push({
+          at: Date.now(),
+          actorId: interaction.user.id,
+          winnerIds: rerolledWinners
+        });
         saveGiveaways(giveaways);
 
         await interaction.channel.send({
-          embeds: [makeEmbed("🎉 Giveaway Rerolled", `New winner: <@${winnerId}>
-**Prize:** ${giveaway.prize}`, "success")]
+          embeds: [makeEmbed("Giveaway Rerolled", `New winner(s): ${rerolledWinners.map(id => `<@${id}>`).join(", ")}\n**Prize:** ${giveaway.prize}`, "success")]
         });
 
-        await interaction.reply({ embeds: [makeEmbed("Rerolled", `New winner is <@${winnerId}>`, "success")], ephemeral: true });
+        await interaction.reply({ embeds: [makeEmbed("Rerolled", `New winner(s): ${rerolledWinners.map(id => `<@${id}>`).join(", ")}`, "success")], ephemeral: true });
         return;
       }
 
@@ -4257,7 +4323,15 @@ if (cmd === "poll") {
           }).catch(() => {});
         }
 
-        await interaction.reply({ embeds: [makeEmbed("Entry Confirmed", "You joined the giveaway.", "success")], ephemeral: true });
+        const bonusAwarded = Math.max(0, giveaway.entryCounts[interaction.user.id] - 1);
+        await interaction.reply({
+          embeds: [makeEmbed(
+            "Entry Confirmed",
+            `You joined the giveaway.\nYour entries for this giveaway: **${giveaway.entryCounts[interaction.user.id]}**${bonusAwarded ? ` (base 1 + bonus ${bonusAwarded})` : ""}.`,
+            "success"
+          )],
+          ephemeral: true
+        });
         return;
       }
     }

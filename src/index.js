@@ -458,7 +458,7 @@ function saveMessageActivity(data) {
 
 function getHourBucket(ts = Date.now()) {
   const d = new Date(ts);
-  d.setUTCMinutes(0, 0, 0);
+  d.setUTCSeconds(0, 0);
   return d.getTime();
 }
 
@@ -2512,6 +2512,42 @@ const RIDDLE_ANSWERS = {
   "what has no voice but can still tell you everything": ["book", "a book", "library"]
 };
 
+const EXTRA_RIDDLE_BANK = [
+  { q: "What has a head, a tail, is brown, and has no legs?", a: ["penny", "a penny", "coin", "a coin"] },
+  { q: "What can't talk but will reply when spoken to?", a: ["echo", "an echo"] },
+  { q: "I have lakes with no water, mountains with no stone, and cities with no buildings. What am I?", a: ["map", "a map"] },
+  { q: "What can you hold without ever touching it?", a: ["conversation", "a conversation"] },
+  { q: "What gets more useful the more you take away from it?", a: ["hole", "a hole"] },
+  { q: "What has one head and one tail, but no body?", a: ["coin", "a coin"] },
+  { q: "What has to be answered but never asks a question?", a: ["phone", "a phone", "telephone"] },
+  { q: "What goes around the world but stays in a corner?", a: ["stamp", "a stamp", "postage stamp"] },
+  { q: "What has many letters but starts empty?", a: ["mailbox", "a mailbox", "postbox", "a postbox"] },
+  { q: "What gets smaller every time it takes a bath?", a: ["soap", "a bar of soap", "bar of soap"] },
+  { q: "What can be long, short, grown, bought, painted, or left bare?", a: ["nails", "fingernails", "your nails"] },
+  { q: "What has an endless supply of letters but starts empty?", a: ["mailbox", "a mailbox"] },
+  { q: "What is easy to get into but hard to get out of?", a: ["trouble"] },
+  { q: "What can you draw without a pencil?", a: ["breath", "your breath"] },
+  { q: "What has a spine but no bones?", a: ["book", "a book"] },
+  { q: "What has a mouth but cannot eat?", a: ["river", "a river"] },
+  { q: "What can be opened but not locked?", a: ["egg", "an egg"] },
+  { q: "What goes up when rain comes down?", a: ["umbrella", "an umbrella"] },
+  { q: "What has a face and hands but no arms or legs?", a: ["clock", "a clock"] },
+  { q: "What belongs to you but everyone else uses it first?", a: ["name", "your name"] }
+];
+
+function addRiddleAnswer(question, answers) {
+  const key = normalizeRiddleText(question);
+  if (!key) return;
+  const existing = Array.isArray(RIDDLE_ANSWERS[key]) ? RIDDLE_ANSWERS[key] : [];
+  const merged = new Set([
+    ...existing.map(normalizeRiddleText),
+    ...(Array.isArray(answers) ? answers : [answers]).map(normalizeRiddleText)
+  ]);
+  RIDDLE_ANSWERS[key] = [...merged].filter(Boolean);
+}
+
+for (const item of EXTRA_RIDDLE_BANK) addRiddleAnswer(item.q, item.a);
+
 function normalizeRiddleText(value) {
   return String(value || "")
     .toLowerCase()
@@ -2543,6 +2579,63 @@ function getRiddleAnswerSet(question) {
 
   const set = new Set(variants.map(normalizeRiddleText).filter(Boolean));
   return [...set];
+}
+
+function getAnswerableRiddles() {
+  const fromConfig = (config.riddle?.riddles || [])
+    .map(question => ({ question, answers: getRiddleAnswerSet(question) }))
+    .filter(item => item.answers.length > 0);
+  const fromExtras = EXTRA_RIDDLE_BANK
+    .map(item => ({ question: item.q, answers: getRiddleAnswerSet(item.q) }))
+    .filter(item => item.answers.length > 0);
+  const seen = new Set();
+  const merged = [];
+  for (const item of [...fromConfig, ...fromExtras]) {
+    const key = normalizeRiddleText(item.question);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
+}
+
+async function sendModerationActionDM(guild, user, options = {}) {
+  if (!user || user.bot) return false;
+  const action = String(options.action || "Moderation action");
+  const reason = String(options.reason || "No reason provided");
+  const moderatorTag = String(options.moderatorTag || "Staff");
+  const durationText = options.duration ? `\nDuration: **${options.duration}**` : "";
+  const extra = options.extra ? `\n${options.extra}` : "";
+  return user.send({
+    embeds: [
+      makeEmbed(
+        `${action} Notice`,
+        `Server: **${guild?.name || "Unknown Server"}**\nAction: **${action}**\nReason: ${reason}${durationText}\nModerator: **${moderatorTag}**${extra}`,
+        options.severity || "warn"
+      )
+    ]
+  }).then(() => true).catch(() => false);
+}
+
+function removeUserFromBlacklistedGiveaways(guildId, userId, roleIds = []) {
+  if (!guildId || !userId || !roleIds.length) return { changed: 0, giveawayIds: [] };
+  const roleSet = new Set(roleIds.map(String));
+  const giveaways = loadGiveaways();
+  let changed = 0;
+  const giveawayIds = [];
+  for (const giveaway of giveaways) {
+    if (giveaway.ended || giveaway.guildId !== guildId) continue;
+    const blocked = (giveaway.blacklistRoleIds || []).some(id => roleSet.has(String(id)));
+    if (!blocked) continue;
+    if (!Array.isArray(giveaway.entries) || !giveaway.entries.includes(userId)) continue;
+    giveaway.entries = giveaway.entries.filter(id => String(id) !== String(userId));
+    if (giveaway.entryCounts && typeof giveaway.entryCounts === "object") delete giveaway.entryCounts[userId];
+    if (giveaway.entrySnapshots && typeof giveaway.entrySnapshots === "object") delete giveaway.entrySnapshots[userId];
+    changed += 1;
+    giveawayIds.push(giveaway.messageId);
+  }
+  if (changed) saveGiveaways(giveaways);
+  return { changed, giveawayIds };
 }
 
 async function ensureGeniusRole(guild) {
@@ -2624,9 +2717,7 @@ async function maybePostDailyRiddle() {
   const slotKey = `${now.dateKey}:${slot}`;
   if (s.lastRiddleSlot === slotKey) return;
 
-  const candidateRiddles = (config.riddle.riddles || [])
-    .map(question => ({ question, answers: getRiddleAnswerSet(question) }))
-    .filter(item => item.answers.length > 0);
+  const candidateRiddles = getAnswerableRiddles();
   if (!candidateRiddles.length) return;
 
   const picked = candidateRiddles[Math.floor(Math.random() * candidateRiddles.length)];
@@ -3027,6 +3118,12 @@ client.on(Events.WebhooksUpdate, async channel => {
 
 client.on(Events.GuildBanAdd, async ban => {
   await sendTypedLog(ban.guild, "member", "Member Banned", `${ban.user.tag} was banned.`, "error");
+  await sendModerationActionDM(ban.guild, ban.user, {
+    action: "Ban",
+    reason: "A moderation ban was applied.",
+    moderatorTag: "Staff",
+    severity: "error"
+  });
   const executorId = await fetchExecutor(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id);
   if (executorId) await antiNukeCheck(ban.guild, executorId, "memberBan", { target: ban.user.tag });
 });
@@ -3063,6 +3160,25 @@ client.on(Events.GuildAuditLogEntryCreate, async entry => {
 });
 
 client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  const oldRoles = new Set([...oldMember.roles.cache.keys()].map(String));
+  const gainedBlacklists = [...newMember.roles.cache.keys()].filter(id => !oldRoles.has(String(id)));
+  if (gainedBlacklists.length) {
+    const pruned = removeUserFromBlacklistedGiveaways(newMember.guild.id, newMember.id, gainedBlacklists);
+    if (pruned.changed) {
+      await sendTypedLog(
+        newMember.guild,
+        "moderation",
+        "Giveaway Entries Removed",
+        `${newMember.user.tag} was removed from active giveaways after receiving a blacklisted role.`,
+        "warn",
+        [
+          { name: "Giveaways Updated", value: String(pruned.changed), inline: true },
+          { name: "Giveaway IDs", value: pruned.giveawayIds.slice(0, 10).join(", ") || "n/a" }
+        ]
+      );
+    }
+  }
+
   const beforeTimeout = Number(oldMember.communicationDisabledUntilTimestamp || 0);
   const afterTimeout = Number(newMember.communicationDisabledUntilTimestamp || 0);
   const now = Date.now();
@@ -3212,6 +3328,12 @@ client.on(Events.InteractionCreate, async interaction => {
 
         await target.timeout(durationMs, reason);
         await interaction.reply({ embeds: [makeEmbed("Timed Out", `${user.tag} has been timed out.`, "warn")] });
+        await sendModerationActionDM(interaction.guild, user, {
+          action: "Timeout",
+          reason,
+          moderatorTag: interaction.user.tag,
+          duration
+        });
 
         await sendTypedLog(interaction.guild, "member", "Member Timed Out", `${interaction.user.tag} timed out ${user.tag}.`, "warn", [
           { name: "Duration", value: duration, inline: true },
@@ -3325,6 +3447,12 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.guild.members.ban(user.id, { reason });
 
         await interaction.reply({ embeds: [makeEmbed("Member Banned", `${user.tag} has been banned.`, "error")] });
+        await sendModerationActionDM(interaction.guild, user, {
+          action: "Ban",
+          reason,
+          moderatorTag: interaction.user.tag,
+          severity: "error"
+        });
         await sendTypedLog(interaction.guild, "member", "Member Banned", `${interaction.user.tag} banned ${user.tag}.`, "error", [
           { name: "Reason", value: reason }
         ]);
@@ -3351,6 +3479,11 @@ client.on(Events.InteractionCreate, async interaction => {
         await target.kick(reason);
 
         await interaction.reply({ embeds: [makeEmbed("Member Kicked", `${user.tag} has been kicked.`, "warn")] });
+        await sendModerationActionDM(interaction.guild, user, {
+          action: "Kick",
+          reason,
+          moderatorTag: interaction.user.tag
+        });
         await sendTypedLog(interaction.guild, "member", "Member Kicked", `${interaction.user.tag} kicked ${user.tag}.`, "warn", [
           { name: "Reason", value: reason }
         ]);
@@ -3426,6 +3559,11 @@ client.on(Events.InteractionCreate, async interaction => {
             { name: "Reason", value: reason },
             { name: "Total Warnings", value: String(count) }
           ])]
+        });
+        await sendModerationActionDM(interaction.guild, user, {
+          action: "Warning",
+          reason,
+          moderatorTag: interaction.user.tag
         });
 
         await sendTypedLog(interaction.guild, "moderation", "Member Warned", `${interaction.user.tag} warned ${user.tag}.`, "warn", [
@@ -4170,7 +4308,12 @@ if (cmd === "poll") {
       }
 
       if (cmd === "riddle") {
-        const r = config.riddle.riddles[Math.floor(Math.random() * config.riddle.riddles.length)];
+        const pool = getAnswerableRiddles();
+        if (!pool.length) {
+          await interaction.reply({ embeds: [makeEmbed("Riddle Unavailable", "No valid riddles are configured right now.", "warn")] });
+          return;
+        }
+        const r = pool[Math.floor(Math.random() * pool.length)].question;
 
         await interaction.reply({
           embeds: [makeEmbed("🧩 Random Riddle", `**Riddle:** ${r}\n\nReply with your guess.`, "info")]
